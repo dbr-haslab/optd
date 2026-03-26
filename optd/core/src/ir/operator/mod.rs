@@ -20,6 +20,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 pub use enforcer::sort::*;
+pub use enforcer::location::*;
 pub use logical::aggregate::*;
 pub use logical::dependent_join::*;
 pub use logical::get::*;
@@ -54,6 +55,7 @@ pub enum OperatorKind {
     Remap(RemapMetadata),
     Subquery(SubqueryMetadata),
     EnforcerSort(EnforcerSortMetadata),
+    EnforcerLocation(EnforcerLocationMetadata),
 }
 
 #[derive(Debug, PartialEq)]
@@ -99,6 +101,7 @@ impl OperatorKind {
             Select(_) => OperatorCategory::Logical,
             Subquery(_) => OperatorCategory::Logical,
             EnforcerSort(_) => OperatorCategory::Enforcer,
+            EnforcerLocation(_) => OperatorCategory::Enforcer,
         }
     }
 
@@ -223,6 +226,9 @@ impl Explain for Operator {
             }
             OperatorKind::EnforcerSort(meta) => {
                 EnforcerSort::borrow_raw_parts(meta, &self.common).explain(ctx, option)
+            }
+            OperatorKind::EnforcerLocation(meta) => {
+                EnforcerLocation::borrow_raw_parts(meta, &self.common).explain(ctx, option)
             }
             OperatorKind::Project(meta) => {
                 Project::borrow_raw_parts(meta, &self.common).explain(ctx, option)

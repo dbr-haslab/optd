@@ -6,8 +6,9 @@ use crate::ir::{
     catalog::DataSourceId,
     explain::Explain,
     macros::{define_node, impl_operator_conversion},
-    properties::OperatorProperties,
+    properties::{OperatorProperties, ExecutionLocation},
 };
+use crate::error::Result as CoreResult;
 use pretty_xmlish::Pretty;
 use std::sync::Arc;
 
@@ -77,6 +78,20 @@ impl Get {
             projections,
             Some(GetImplementation::TableScan),
         )
+    }
+}
+
+impl GetBorrowed<'_> {
+    /// Retrieves the execution location for this scan from the catalog.
+    /// Returns the location stored in the table metadata, or ExecutionLocation::any() as default.
+    pub fn get_location(&self, ctx: &crate::ir::IRContext) -> CoreResult<ExecutionLocation> {
+        match ctx.catalog.table(self.data_source_id().clone()) {
+            Ok(table_metadata) => Ok(table_metadata.location.clone()),
+            Err(_) => {
+                // If table not found in catalog, default to Any
+                Ok(ExecutionLocation::any())
+            }
+        }
     }
 }
 

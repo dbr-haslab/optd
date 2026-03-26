@@ -13,7 +13,7 @@ use crate::{
         rule::{OperatorPattern, Rule, RuleSet},
     },
     memo::{CostedExpr, Exploration, MemoGroupExpr, MemoTable, Optimization, Status, WithId},
-    rules::{EnforceTupleOrderingRule, SimplificationPass},
+    rules::{EnforceTupleOrderingRule, EnforceExecutionLocationRule, SimplificationPass},
 };
 
 pub struct Cascades {
@@ -165,20 +165,28 @@ impl Cascades {
         properties: &Arc<OperatorProperties>,
     ) {
         let group = Group::new(group_id, properties.clone()).into_operator();
-        let enforcer_rule = EnforceTupleOrderingRule::new(required.tuple_ordering.clone());
-        let new_enforcers = enforcer_rule.transform(&group, &self.ctx).unwrap();
-        let total_produced = new_enforcers.len();
+        
+        // Enforce tuple ordering
+        let tuple_ordering_rule = EnforceTupleOrderingRule::new(required.tuple_ordering.clone());
+        let mut all_enforcers = tuple_ordering_rule.transform(&group, &self.ctx).unwrap();
+        
+        // Enforce execution location
+        let location_rule = EnforceExecutionLocationRule::new(required.execution_location.clone());
+        let location_enforcers = location_rule.transform(&group, &self.ctx).unwrap();
+        all_enforcers.extend(location_enforcers);
+        
+        let total_produced = all_enforcers.len();
         let mut newly_produced = 0;
         {
             let mut writer = self.memo.write().await;
-            for op in new_enforcers {
+            for op in all_enforcers {
                 if writer.insert_operator_into_group(op, group_id).is_ok() {
                     newly_produced += 1;
                 }
             }
         }
         info!(
-            rule = enforcer_rule.name(),
+            rules = "enforce_tuple_ordering,enforce_execution_location",
             total_produced, newly_produced, "applied"
         )
     }
@@ -287,7 +295,7 @@ impl Cascades {
             let input_group_id = expr.key().input_operators()[0];
             let rx = self
                 .clone()
-                .find_best_costed_expr_for(input_group_id, Arc::new(Required { tuple_ordering }))
+                .find_best_costed_expr_for(input_group_id, Arc::new(Required { tuple_ordering, execution_location: Default::default() }))
                 .await;
             let state = rx.borrow();
             let costed_expr = state

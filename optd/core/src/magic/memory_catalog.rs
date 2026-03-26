@@ -7,6 +7,7 @@ use tracing::info;
 
 use crate::ir::{
     catalog::*,
+    properties::ExecutionLocation,
     statistics::TableStatistics,
     table_ref::{ResolvedTableRef, TableRef},
 };
@@ -43,6 +44,15 @@ impl MemoryCatalog {
 
 impl Catalog for MemoryCatalog {
     fn create_table(&self, table: TableRef, schema: Arc<Schema>) -> Result<DataSourceId> {
+        self.create_table_with_location(table, schema, ExecutionLocation::any())
+    }
+
+    fn create_table_with_location(
+        &self,
+        table: TableRef,
+        schema: Arc<Schema>,
+        location: ExecutionLocation,
+    ) -> Result<DataSourceId> {
         let mut writer = self.inner.write().unwrap();
         let id = DataSourceId(writer.next_table_id);
         let table = self.resolve_table_ref(table);
@@ -62,6 +72,7 @@ impl Catalog for MemoryCatalog {
                 table,
                 schema,
                 statistics: None,
+                location,
             },
         );
         writer.next_table_id += 1;

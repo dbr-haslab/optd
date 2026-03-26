@@ -8,7 +8,7 @@ use crate::ir::{
     OperatorKind,
     catalog::Field,
     operator::{
-        Aggregate, DependentJoin, EnforcerSort, Get, Join, Limit, OrderBy, Project, Remap, Select,
+        Aggregate, DependentJoin, EnforcerSort, EnforcerLocation, Get, Join, Limit, OrderBy, Project, Remap, Select,
         Subquery, join::JoinType,
     },
     properties::{Derive, GetProperty, PropertyMarker},
@@ -69,6 +69,10 @@ impl Derive<OutputSchema> for Operator {
             OperatorKind::EnforcerSort(meta) => {
                 let sort = EnforcerSort::borrow_raw_parts(meta, &self.common);
                 sort.input().output_schema(ctx)
+            }
+            OperatorKind::EnforcerLocation(meta) => {
+                let enforcer = EnforcerLocation::borrow_raw_parts(meta, &self.common);
+                enforcer.input().output_schema(ctx)
             }
             OperatorKind::OrderBy(meta) => {
                 let order_by = OrderBy::borrow_raw_parts(meta, &self.common);

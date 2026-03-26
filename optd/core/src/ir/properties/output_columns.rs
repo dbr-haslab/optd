@@ -50,6 +50,7 @@ impl Derive<OutputColumns> for crate::ir::Operator {
             | OperatorKind::Limit(_)
             | OperatorKind::OrderBy(_)
             | OperatorKind::EnforcerSort(_)
+            | OperatorKind::EnforcerLocation(_)
             | OperatorKind::Subquery(_) => {
                 let set = self.input_operators().iter().try_fold(
                     ColumnSet::default(),

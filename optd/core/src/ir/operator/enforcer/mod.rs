@@ -3,3 +3,4 @@
 //! only its physical representation.
 
 pub mod sort;
+pub mod location;

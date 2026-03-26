@@ -29,6 +29,7 @@ datafusion = { version = "52.0.0", default-features = false, features = [
     "unicode_expressions",
     "datetime_expressions",
 ] }
+datafusion-sql = { version = "52.0.0", default-features = false, features = ["unparser"] }
 
 arrow = { version = "57.2.0", default-features = false }
 arrow-schema = { version = "57.2.0", default-features = false }

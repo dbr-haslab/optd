@@ -1,6 +1,7 @@
 use std::{sync::Arc, vec};
 
 use datafusion::{
+    catalog::default_table_source::DefaultTableSource,
     common::{Column, DFSchema},
     execution::FunctionRegistry,
     logical_expr::{
@@ -8,17 +9,19 @@ use datafusion::{
         utils::enumerate_grouping_sets,
     },
 };
+use datafusion::sql::TableReference;
+use datafusion_sql::unparser::plan_to_sql;
 use itertools::Itertools;
 use optd_core::ir::{
     Operator, OperatorKind, Scalar,
     catalog::Field,
     convert::IntoOperator,
     operator::{
-        Aggregate, AggregateBorrowed, EnforcerSort, EnforcerSortBorrowed, Get, GetBorrowed, Join,
+        Aggregate, AggregateBorrowed, EnforcerLocation, EnforcerLocationBorrowed, EnforcerSort, EnforcerSortBorrowed, Get, GetBorrowed, Join,
         JoinBorrowed, Limit, LimitBorrowed, Project, ProjectBorrowed, Remap, RemapBorrowed, Select,
         SelectBorrowed, split_equi_and_non_equi_conditions,
     },
-    properties::TupleOrderingDirection,
+    properties::{TupleOrderingDirection},
     scalar::{
         BinaryOp, BinaryOpBorrowed, BinaryOpKind, Case, CaseBorrowed, Cast, CastBorrowed,
         ColumnRef, ColumnRefBorrowed, Function, FunctionBorrowed, FunctionKind, InList,
@@ -66,6 +69,10 @@ impl OptdQueryPlannerContext<'_> {
             OperatorKind::EnforcerSort(meta) => {
                 let node = EnforcerSort::borrow_raw_parts(meta, &optd_plan.common);
                 self.try_from_optd_enforcer_sort(node)
+            }
+            OperatorKind::EnforcerLocation(meta) => {
+                let node = EnforcerLocation::borrow_raw_parts(meta, &optd_plan.common);
+                self.try_from_optd_enforcer_location(node)
             }
             kind => whatever!("unsupported operator type {kind:?}"),
         }
@@ -300,6 +307,78 @@ impl OptdQueryPlannerContext<'_> {
             input: Arc::new(input),
             fetch: None,
         }))
+    }
+
+    pub fn try_from_optd_enforcer_location(
+        &mut self,
+        node: EnforcerLocationBorrowed<'_>,
+    ) -> Result<DFLogicalPlan> {
+        use optd_core::ir::properties::Location;
+        use crate::planner::postgres_remote::{PostgresRemoteConfig, PostgresRemoteExecutor};
+        
+        let input = self.try_from_optd_plan(node.input())?;
+        let location = node.location();
+        
+        // Convert the logical plan to SQL statement
+        let sql_statement = plan_to_sql(&input).context(DataFusionSnafu)?;
+        let sql_str = sql_statement.to_string();
+        
+        tracing::info!("Generated SQL for {} location: {}", location, sql_str);
+        
+        // Match on location and create appropriate remote table provider
+        match location.location() {
+            Location::PostgreSQL => {
+                // Try to get PostgreSQL connection configuration
+                if let Some(config) = PostgresRemoteConfig::from_env_or_default() {
+                    let executor = PostgresRemoteExecutor::new(config);
+                    
+                    // Create a remote table provider for the SQL query
+                    // The provider will use the schema from the sub-plan
+                    let provider =
+                        executor.create_remote_provider(sql_str.clone(), input.schema().clone())?;
+                    
+                    // Generate a unique table name based on the SQL query hash
+                    let query_hash = PostgresRemoteExecutor::query_hash(&sql_str);
+                    let table_name = PostgresRemoteExecutor::create_table_reference(query_hash);
+                    let table_ref = TableReference::bare(table_name);
+                    
+                    tracing::info!(
+                        "Created PostgreSQL remote table provider: {} (hash: {})",
+                        table_ref, query_hash
+                    );
+                    
+                    // Create a DefaultTableSource wrapper for the remote provider
+                    let table_source = Arc::new(
+                        DefaultTableSource::new(provider)
+                    );
+                    let table_source = table_source as Arc<dyn datafusion::logical_expr::TableSource>;
+                    
+                    // Create a TableScan using the remote table source
+                    let table_scan = logical_plan::TableScan::try_new(
+                        table_ref,
+                        table_source,
+                        None,
+                        vec![],
+                        None,
+                    )
+                    .whatever_context("failed to create remote TableScan")?;
+                    
+                    Ok(DFLogicalPlan::TableScan(table_scan))
+                } else {
+                    tracing::debug!("PostgreSQL connection not configured (set OPTD_POSTGRES_URL) - passing through to local execution");
+                    Ok(input)
+                }
+            }
+            Location::DuckDB => {
+                // DuckDB remote execution
+                tracing::debug!("DuckDB remoting not yet fully implemented - passing through to local execution");
+                Ok(input)
+            }
+            Location::DataFusion | Location::Any => {
+                // No remoting needed for DataFusion execution
+                Ok(input)
+            }
+        }
     }
 
     pub fn try_from_optd_get(&mut self, node: GetBorrowed<'_>) -> Result<DFLogicalPlan> {

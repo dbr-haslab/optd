@@ -21,6 +21,7 @@ mod output_columns;
 mod output_schema;
 mod required;
 mod tuple_ordering;
+mod execution_location;
 
 use std::sync::{Arc, OnceLock};
 
@@ -28,6 +29,7 @@ pub use cardinality::*;
 pub use output_columns::OutputColumns;
 pub use required::Required;
 pub use tuple_ordering::*;
+pub use execution_location::{ExecutionLocation, Location};
 
 use crate::ir::{ColumnSet, context::IRContext};
 

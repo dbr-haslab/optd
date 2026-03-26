@@ -7,6 +7,7 @@ pub use arrow_schema::SchemaRef;
 use snafu::prelude::*;
 
 use crate::ir::{
+    properties::ExecutionLocation,
     statistics::TableStatistics,
     table_ref::{ResolvedTableRef, TableRef},
 };
@@ -46,7 +47,7 @@ pub type Result<T> = core::result::Result<T, CatalogError>;
 /// Metadata recorded for a table known to the catalog.
 ///
 /// Returned by catalog lookup APIs to provide the table's stable id, resolved
-/// name, schema, and any available statistics.
+/// name, schema, optional statistics, and execution location.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableMetadata {
     /// Stable identifier assigned by the catalog for this table.
@@ -57,18 +58,37 @@ pub struct TableMetadata {
     pub schema: SchemaRef,
     /// Optional statistics recorded for the table.
     pub statistics: Option<TableStatistics>,
+    /// Execution location where this table is stored/should be scanned from.
+    pub location: ExecutionLocation,
 }
 
 /// Catalog interface for registering and resolving table metadata.
 ///
-/// optd uses this abstraction to inspect schemas, stable table identities, and
-/// optional statistics during planning and execution.
+/// optd uses this abstraction to inspect schemas, stable table identities,
+/// optional statistics, and execution locations during planning and execution.
 pub trait Catalog: Send + Sync + 'static {
-    /// Registers `table` with the provided `schema` and returns its stable data source id.
+    /// Registers `table` with the provided `schema` and optional location, returning its stable data source id.
     ///
     /// Returns [`CatalogError::TableAlreadyExists`] if the resolved table reference has
     /// already been registered.
+    ///
+    /// If location is not provided, defaults to [`ExecutionLocation::any`].
     fn create_table(&self, table: TableRef, schema: SchemaRef) -> Result<DataSourceId>;
+
+    /// Registers `table` with the provided `schema`, location, and returns its stable data source id.
+    ///
+    /// Returns [`CatalogError::TableAlreadyExists`] if the resolved table reference has
+    /// already been registered.
+    fn create_table_with_location(
+        &self,
+        table: TableRef,
+        schema: SchemaRef,
+        _location: ExecutionLocation,
+    ) -> Result<DataSourceId> {
+        // Default implementation ignores location and delegates to create_table
+        // Implementations can override for custom behavior
+        self.create_table(table, schema)
+    }
 
     /// Returns the metadata associated with `table_id`.
     ///
