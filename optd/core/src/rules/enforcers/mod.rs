@@ -59,9 +59,9 @@ impl Rule for EnforceExecutionLocationRule {
     fn transform(
         &self,
         operator: &crate::ir::Operator,
-        _ctx: &crate::ir::IRContext,
+        ctx: &crate::ir::IRContext,
     ) -> crate::error::Result<Vec<Arc<crate::ir::Operator>>> {
-        if self.location.0 == crate::ir::properties::Location::Any {
+        if self.location.0 != crate::ir::properties::Location::Local {
             return Ok(vec![]);
         }
         Ok(vec![

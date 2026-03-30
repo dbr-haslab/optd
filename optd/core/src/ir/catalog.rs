@@ -11,6 +11,7 @@ use crate::ir::{
     statistics::TableStatistics,
     table_ref::{ResolvedTableRef, TableRef},
 };
+use crate::ir::properties::Location;
 
 /// A stable identifier for a catalog-registered data source.
 ///
@@ -59,7 +60,7 @@ pub struct TableMetadata {
     /// Optional statistics recorded for the table.
     pub statistics: Option<TableStatistics>,
     /// Execution location where this table is stored/should be scanned from.
-    pub location: ExecutionLocation,
+    pub location: Location,
 }
 
 /// Catalog interface for registering and resolving table metadata.
@@ -72,7 +73,7 @@ pub trait Catalog: Send + Sync + 'static {
     /// Returns [`CatalogError::TableAlreadyExists`] if the resolved table reference has
     /// already been registered.
     ///
-    /// If location is not provided, defaults to [`ExecutionLocation::any`].
+    /// If location is not provided.
     fn create_table(&self, table: TableRef, schema: SchemaRef) -> Result<DataSourceId>;
 
     /// Registers `table` with the provided `schema`, location, and returns its stable data source id.
@@ -83,7 +84,7 @@ pub trait Catalog: Send + Sync + 'static {
         &self,
         table: TableRef,
         schema: SchemaRef,
-        _location: ExecutionLocation,
+        _location: Location,
     ) -> Result<DataSourceId> {
         // Default implementation ignores location and delegates to create_table
         // Implementations can override for custom behavior

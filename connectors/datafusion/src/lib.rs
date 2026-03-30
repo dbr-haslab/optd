@@ -6,7 +6,8 @@ mod table;
 use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
-use datafusion::common::plan_datafusion_err;
+use datafusion::catalog::{Session, TableProvider, TableProviderFactory};
+use datafusion::common::{plan_datafusion_err, Constraints};
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionStateBuilder;
@@ -17,12 +18,14 @@ use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use datafusion::sql::TableReference;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::dialect_from_str;
+use datafusion_table_providers::sqlite::SqliteTableProviderFactory;
 pub use extension::{OptdExtension, OptdExtensionConfig};
 pub use planner::OptdQueryPlanner;
 pub use table::{OptdTable, OptdTableProvider};
 
 pub use optd_core::error::Error as OptdError;
 pub use optd_core::error::Result as OptdResult;
+use optd_core::ir::properties::{ExecutionLocation, Location};
 use optd_core::ir::table_ref::TableRef as OptdTableRef;
 
 pub trait SessionStateBuilderOptdExt: Sized {
@@ -83,6 +86,7 @@ pub fn create_optd_session_context(
         .with_default_features()
         .with_optimizer_rules(default_datafusion_rules())
         .with_optd_planner()
+        .with_table_factory("SQLITE".to_string(), Arc::new(SqliteTableProviderFactory::new()) as Arc<dyn TableProviderFactory>)
         .build();
     SessionContext::new_with_state(state)
 }
@@ -123,13 +127,20 @@ impl OptdSessionContext {
     fn sync_optd_catalog_from_plan(&self, plan: &LogicalPlan) -> Result<(), DataFusionError> {
         if let LogicalPlan::Ddl(ddl) = plan {
             match ddl {
-                DdlStatement::CreateExternalTable(create_table) => self.create_table(
-                    create_table.name.clone(),
-                    create_table.schema.inner().clone(),
-                ),
+                DdlStatement::CreateExternalTable(create_table) => {
+                    let location = match create_table.file_type.as_str() {
+                        "SQLITE" => Location::Remote,
+                        _ => Location::Local,
+                    };
+                    self.create_table(
+                        create_table.name.clone(),
+                        create_table.schema.inner().clone(),
+                        location,
+                    )
+                },
                 DdlStatement::CreateMemoryTable(create_table) => {
                     let schema = create_table.input.schema();
-                    self.create_table(create_table.name.clone(), schema.inner().clone())
+                    self.create_table(create_table.name.clone(), schema.inner().clone(), Location::Local)
                 }
                 DdlStatement::DropTable(drop_table) => self.drop_table(drop_table.name.clone()),
                 _ => Ok(()),
@@ -143,6 +154,7 @@ impl OptdSessionContext {
         &self,
         table_ref: impl Into<TableReference>,
         schema: datafusion::arrow::datatypes::SchemaRef,
+        location: Location
     ) -> Result<(), DataFusionError> {
         let table_ref: TableReference = table_ref.into();
         let optd_table_ref = Self::into_optd_table_ref(&table_ref);
@@ -154,7 +166,7 @@ impl OptdSessionContext {
 
         extension
             .catalog()
-            .create_table(optd_table_ref, schema)
+            .create_table_with_location(optd_table_ref, schema, location)
             .map_err(|e| {
                 DataFusionError::External(Box::new(optd_core::error::Error::Catalog { source: e }))
             })?;

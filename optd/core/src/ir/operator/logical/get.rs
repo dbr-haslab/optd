@@ -86,7 +86,7 @@ impl GetBorrowed<'_> {
     /// Returns the location stored in the table metadata, or ExecutionLocation::any() as default.
     pub fn get_location(&self, ctx: &crate::ir::IRContext) -> CoreResult<ExecutionLocation> {
         match ctx.catalog.table(self.data_source_id().clone()) {
-            Ok(table_metadata) => Ok(table_metadata.location.clone()),
+            Ok(table_metadata) => Ok(ExecutionLocation(table_metadata.location.clone())),
             Err(_) => {
                 // If table not found in catalog, default to Any
                 Ok(ExecutionLocation::any())
@@ -101,10 +101,11 @@ impl Explain for GetBorrowed<'_> {
         ctx: &crate::ir::IRContext,
         option: &crate::ir::explain::ExplainOption,
     ) -> pretty_xmlish::Pretty<'a> {
-        let mut fields = Vec::with_capacity(5);
+        let mut fields = Vec::with_capacity(6);
         fields.push((".data_source_id", Pretty::display(&self.data_source_id().0)));
         fields.push((".table_index", Pretty::display(&self.table_index())));
         fields.push((".implementation", Pretty::debug(self.implementation())));
+        fields.push((".location", Pretty::debug(&self.get_location(ctx))));
         fields.extend(self.common.explain_operator_properties(ctx, option));
         Pretty::childless_record("Get", fields)
     }

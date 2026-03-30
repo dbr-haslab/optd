@@ -43,7 +43,7 @@ impl Explain for EnforcerLocationBorrowed<'_> {
         option: &crate::ir::explain::ExplainOption,
     ) -> Pretty<'a> {
         let mut fields = Vec::with_capacity(1);
-        fields.push(("location", Pretty::display(self.location())));
+        fields.push((".location", Pretty::display(self.location())));
 
         let metadata = self.common.explain_operator_properties(ctx, option);
         fields.extend(metadata);

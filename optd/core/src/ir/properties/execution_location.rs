@@ -12,23 +12,20 @@ use crate::ir::{Operator, OperatorCategory, OperatorKind};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
 pub enum Location {
     /// Default/unspecified location (usually means any location)
-    #[default]
     Any,
-    /// DataFusion execution engine
-    DataFusion,
-    /// PostgreSQL execution engine
-    PostgreSQL,
-    /// DuckDB execution engine
-    DuckDB,
+    /// Local execution engine
+    #[default]
+    Local,
+    /// Remote SQL execution engine
+    Remote,
 }
 
 impl std::fmt::Display for Location {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Location::Any => write!(f, "Any"),
-            Location::DataFusion => write!(f, "DataFusion"),
-            Location::PostgreSQL => write!(f, "PostgreSQL"),
-            Location::DuckDB => write!(f, "DuckDB"),
+            Location::Local => write!(f, "Local"),
+            Location::Remote => write!(f, "Remote"),
         }
     }
 }
@@ -89,9 +86,18 @@ fn satisfy_join_location(
     Ok(Some(Arc::from(vec![location.clone(), location.clone()])))
 }
 
-fn satisfy_scan_location(_location: &ExecutionLocation) -> Option<Arc<[ExecutionLocation]>> {
-    // Table scans have no input requirements
-    Some(Arc::from(vec![]))
+fn satisfy_scan_location(
+    get: &GetBorrowed<'_>,
+    location: &ExecutionLocation,
+    ctx: &crate::ir::context::IRContext,
+) -> Result<Option<Arc<[ExecutionLocation]>>> {
+    let table_location = get.get_location(ctx);
+    if (table_location?).matches(location) {
+        Ok(Some(Arc::from(vec![])))
+    } else {
+        // If the scan's location doesn't match the required location, it cannot satisfy the property
+        Ok(None)
+    }
 }
 
 impl crate::ir::properties::TrySatisfy<ExecutionLocation> for Operator {
@@ -102,7 +108,10 @@ impl crate::ir::properties::TrySatisfy<ExecutionLocation> for Operator {
     ) -> Result<Option<Arc<[ExecutionLocation]>>> {
         let satisfied = match &self.kind {
             OperatorKind::Group(_) => None,
-            OperatorKind::Get(_) => satisfy_scan_location(location),
+            OperatorKind::Get(meta) => {
+                let get = Get::borrow_raw_parts(meta, &self.common);
+                satisfy_scan_location(&get, location, ctx)?
+            },
             OperatorKind::Join(meta) => {
                 let join = Join::borrow_raw_parts(meta, &self.common);
                 satisfy_join_location(join.outer(), join.inner(), location, ctx)?
@@ -145,8 +154,8 @@ impl crate::ir::properties::TrySatisfy<ExecutionLocation> for Operator {
             }
             OperatorKind::EnforcerLocation(meta) => {
                 // EnforcerLocation enforces the location; only satisfies if it matches
-                (&meta.location == location || location.0 == Location::Any)
-                    .then(|| Arc::from(vec![ExecutionLocation::any()]))
+                (&meta.location == location)
+                    .then(|| Arc::from(vec![ExecutionLocation(Location::Remote)]))
             }
         };
         Ok(satisfied)
@@ -163,11 +172,11 @@ mod tests {
 
     #[test]
     fn location_matches() {
-        assert!(ExecutionLocation::any().matches(&ExecutionLocation::new(Location::DataFusion)));
-        assert!(ExecutionLocation::new(Location::DataFusion)
-            .matches(&ExecutionLocation::new(Location::DataFusion)));
-        assert!(!ExecutionLocation::new(Location::DataFusion)
-            .matches(&ExecutionLocation::new(Location::PostgreSQL)));
+        assert!(ExecutionLocation::any().matches(&ExecutionLocation::new(Location::Local)));
+        assert!(ExecutionLocation::new(Location::Local)
+            .matches(&ExecutionLocation::new(Location::Local)));
+        assert!(!ExecutionLocation::new(Location::Local)
+            .matches(&ExecutionLocation::new(Location::Remote)));
     }
 
     #[test]
@@ -175,7 +184,7 @@ mod tests {
         let ctx = test_ctx_with_tables(&[("t1", 2)])?;
         let t1 = ctx.logical_get(TableRef::bare("t1"), None)?.build();
 
-        let location = ExecutionLocation::new(Location::DataFusion);
+        let location = ExecutionLocation::new(Location::Local);
         let res = t1.try_satisfy(&location, &ctx)?.unwrap();
         assert_eq!(res.len(), 0);
 
@@ -191,7 +200,7 @@ mod tests {
         let ctx = test_ctx_with_tables(&[("t1", 2)])?;
         let t1 = ctx.logical_get(TableRef::bare("t1"), None)?.build();
 
-        let enforcer_location = ExecutionLocation::new(Location::PostgreSQL);
+        let enforcer_location = ExecutionLocation::new(Location::Remote);
         let enforcer = EnforcerLocation::new(enforcer_location.clone(), t1.clone())
             .into_operator();
 
@@ -205,7 +214,7 @@ mod tests {
         assert_eq!(res.as_ref()[0], ExecutionLocation::any());
 
         // Should not satisfy different location
-        let different = ExecutionLocation::new(Location::DataFusion);
+        let different = ExecutionLocation::new(Location::Local);
         assert_eq!(None, enforcer.try_satisfy(&different, &ctx)?);
 
         Ok(())

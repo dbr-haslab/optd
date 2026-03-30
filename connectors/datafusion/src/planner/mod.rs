@@ -1,7 +1,6 @@
 mod from_optd;
 mod into_optd;
 mod utils;
-mod postgres_remote;
 
 use std::{collections::HashMap, sync::Arc};
 

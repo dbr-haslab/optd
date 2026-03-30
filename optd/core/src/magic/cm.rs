@@ -1,3 +1,4 @@
+use bitvec::macros::internal::funty::Fundamental;
 use crate::ir::{
     cost::{Cost, CostModel},
     operator::*,
@@ -11,9 +12,8 @@ pub struct MagicCostModel;
 impl MagicCostModel {
     const MAGIC_COMPUTATION_FACTOR: f64 = 5f64;
     // Location remoting costs
-    const REMOTING_CONSTANT_PENALTY: f64 = 10000.0;
-    const REMOTING_FACTOR: f64 = 0.5;
-    const FORBIDDEN_REMOTING_COST: f64 = 1e10; // Very large cost for forbidden combinations
+    const REMOTING_CONSTANT_PENALTY: f64 = 1000.0;
+    const REMOTING_FACTOR: f64 = 10f64;
 
     fn sort_cost(input_card: crate::ir::properties::Cardinality) -> Cost {
         Cost::UNIT * input_card.as_f64() * input_card.as_f64().ln_1p().max(1.0)
@@ -49,75 +49,13 @@ impl MagicCostModel {
         input_card.as_f64() * num_exprs as f64 * Self::MAGIC_COMPUTATION_FACTOR * Cost::UNIT
     }
 
-    /// Calculates the cost of remoting data from source location to target location.
-    /// Returns a finite cost for PostgreSQL/DuckDB -> DataFusion transfers,
-    /// and infinite cost for all other combinations.
+    /// Calculates the cost of remoting data.
     fn location_remoting_cost(
-        source_location: Location,
-        target_location: Location,
         input_card: crate::ir::properties::Cardinality,
+        num_cols: usize,
     ) -> Cost {
-        use Location::*;
-        match (source_location, target_location) {
-            // Allow PostgreSQL -> DataFusion with cardinality-proportional cost
-            (PostgreSQL, DataFusion) => {
-                Cost::UNIT * (Self::REMOTING_CONSTANT_PENALTY
-                    + input_card.as_f64() * Self::REMOTING_FACTOR)
-            }
-            // Allow DuckDB -> DataFusion with cardinality-proportional cost
-            (DuckDB, DataFusion) => {
-                Cost::UNIT * (Self::REMOTING_CONSTANT_PENALTY
-                    + input_card.as_f64() * Self::REMOTING_FACTOR)
-            }
-            // All other combinations are forbidden
-            _ => Cost::new(Self::FORBIDDEN_REMOTING_COST),
-        }
-    }
-
-    /// Extracts the location of an input operator.
-    /// For Get operators, queries the catalog for table location.
-    /// For other operators, recursively finds the underlying Get operator.
-    fn extract_input_location(
-        input: &crate::ir::Operator,
-        ctx: &crate::ir::IRContext,
-    ) -> Location {
-        use crate::ir::OperatorKind;
-        match &input.kind {
-            OperatorKind::Get(meta) => {
-                // Get operators have catalog-stored locations
-                match ctx.catalog.table(meta.data_source_id) {
-                    Ok(table_meta) => table_meta.location.location(),
-                    Err(_) => Location::Any, // Default if table not found
-                }
-            }
-            // Pass-through operators: recursively extract from input
-            OperatorKind::Project(meta) => {
-                let project = Project::borrow_raw_parts(meta, &input.common);
-                Self::extract_input_location(project.input(), ctx)
-            }
-            OperatorKind::Select(meta) => {
-                let select = Select::borrow_raw_parts(meta, &input.common);
-                Self::extract_input_location(select.input(), ctx)
-            }
-            OperatorKind::Limit(meta) => {
-                let limit = Limit::borrow_raw_parts(meta, &input.common);
-                Self::extract_input_location(limit.input(), ctx)
-            }
-            OperatorKind::OrderBy(meta) => {
-                let order_by = OrderBy::borrow_raw_parts(meta, &input.common);
-                Self::extract_input_location(order_by.input(), ctx)
-            }
-            OperatorKind::EnforcerSort(meta) => {
-                let enforcer = EnforcerSort::borrow_raw_parts(meta, &input.common);
-                Self::extract_input_location(enforcer.input(), ctx)
-            }
-            OperatorKind::Remap(meta) => {
-                let remap = Remap::borrow_raw_parts(meta, &input.common);
-                Self::extract_input_location(remap.input(), ctx)
-            }
-            // For other operators, default to Any
-            _ => Location::Any,
-        }
+        // FIXME(jop): Should know the source location
+        (Self::REMOTING_CONSTANT_PENALTY + input_card.as_f64() * num_cols.as_f64() * Self::REMOTING_FACTOR) * Cost::UNIT
     }
 }
 
@@ -192,15 +130,9 @@ impl CostModel for MagicCostModel {
             }
             OperatorKind::EnforcerLocation(meta) => {
                 let enforcer = EnforcerLocation::borrow_raw_parts(meta, &op.common);
-                let input = enforcer.input();
-                let input_card = input.cardinality(ctx);
-                let target_location = enforcer.location().location();
-                let source_location = Self::extract_input_location(input, ctx);
-                Ok(Self::location_remoting_cost(
-                    source_location,
-                    target_location,
-                    input_card,
-                ))
+                let cols = op.properties().output_columns.get().unwrap().len();
+                let input_card = enforcer.input().cardinality(ctx);
+                Ok(Self::location_remoting_cost(input_card, cols))
             }
         }
     }
