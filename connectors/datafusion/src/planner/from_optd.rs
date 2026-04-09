@@ -10,8 +10,10 @@ use datafusion::{
     },
 };
 use datafusion::logical_expr::Extension;
-use datafusion_federation::FederatedPlanNode;
-use datafusion_federation::sql::{SQLExecutor, SQLFederationPlanner};
+use datafusion::datasource::{provider_as_source, source_as_provider};
+use datafusion_federation::{FederatedPlanNode, FederationPlanner, FederatedTableProviderAdaptor};
+use datafusion_federation::sql::{SQLExecutor, SQLExecutorRef, SQLFederationPlanner, SQLTableSource};
+use datafusion_table_providers::sqlite::write::SqliteTableWriter;
 use itertools::Itertools;
 use optd_core::ir::{
     Operator, OperatorKind, Scalar,
@@ -33,7 +35,6 @@ use optd_core::ir::{
     table_ref::TableRef,
 };
 use snafu::{OptionExt, ResultExt, whatever};
-
 use crate::planner::{DataFusionSnafu, OptdQueryPlannerContext, OptdSnafu, Result};
 
 impl OptdQueryPlannerContext<'_> {
@@ -310,6 +311,29 @@ impl OptdQueryPlannerContext<'_> {
         }))
     }
 
+    /// Extracts an [`SQLExecutorRef`] from a DataFusion [`TableSource`].
+    ///
+    /// Executor is wrapped inside a [`SqliteTableWriter`] (when created via `CREATE EXTERNAL TABLE … STORED AS SQLITE`).
+    /// In that case the federation-capable provider lives in `SqliteTableWriter::read_provider`.
+    fn extract_sql_executor(source: &Arc<dyn logical_expr::TableSource>) -> Option<SQLExecutorRef> {
+
+        let provider = source_as_provider(source).ok()?;
+        if let Some(writer) = provider.as_any().downcast_ref::<SqliteTableWriter>() {
+            if let Some(adaptor) = writer
+                .read_provider
+                .as_any()
+                .downcast_ref::<FederatedTableProviderAdaptor>()
+            {
+                if let Some(sql_source) = adaptor.source.as_any().downcast_ref::<SQLTableSource>() {
+                    println!("------- Found SQLTableSource inside SqliteTableWriter's read_provider");
+                    return Some(Arc::clone(&sql_source.provider.executor));
+                }
+            }
+        }
+
+        None
+    }
+
     pub fn try_from_optd_enforcer_location(
         &mut self,
         node: EnforcerLocationBorrowed<'_>,
@@ -317,9 +341,17 @@ impl OptdQueryPlannerContext<'_> {
         use optd_core::ir::properties::Location;
 
         let input = self.try_from_optd_plan(node.input())?;
-        let location = node.location();
 
-        let x = self.session_state.table_factories_mut().get("SQLITE").unwrap();
+        // Extract an SQLExecutor from any SQLite-backed table source in this plan.
+        // All Remote tables share the same SQLite connection context, so any one
+        // executor is sufficient to drive the federated sub-plan.
+        let executor = self
+            .table_reference_to_source
+            .values()
+            .find_map(Self::extract_sql_executor)
+            .whatever_context(
+                "no SQLite-backed table source found to create federation planner",
+            )?;
 
         let planner = SQLFederationPlanner::new(executor);
         let fed_plan = FederatedPlanNode::new(input, Arc::new(planner));
@@ -327,63 +359,26 @@ impl OptdQueryPlannerContext<'_> {
             node: Arc::new(fed_plan),
         };
         Ok(DFLogicalPlan::Extension(ext_node))
+    }
 
-        // // Convert the logical plan to SQL statement
-        // let sql_statement = plan_to_sql(&input).context(DataFusionSnafu)?;
-        // let sql_str = sql_statement.to_string();
-
-        // tracing::info!("Generated SQL for {} location: {}", location, sql_str);
-
-        // Match on location and create appropriate remote table provider
-        // match location.location() {
-        //     Location::Remote => {
-        //         // FIXME(jop): Generalize to support multiple remote execution engines instead of hardcoding PostgreSQL
-        //         // Try to get PostgreSQL connection configuration
-        //         if let Some(config) = PostgresRemoteConfig::from_env_or_default() {
-        //             let executor = PostgresRemoteExecutor::new(config);
-        //
-        //             // Create a remote table provider for the SQL query
-        //             // The provider will use the schema from the sub-plan
-        //             let provider =
-        //                 executor.create_remote_provider(sql_str.clone(), input.schema().clone())?;
-        //
-        //             // Generate a unique table name based on the SQL query hash
-        //             let query_hash = PostgresRemoteExecutor::query_hash(&sql_str);
-        //             let table_name = PostgresRemoteExecutor::create_table_reference(query_hash);
-        //             let table_ref = TableReference::bare(table_name);
-        //
-        //             tracing::info!(
-        //                 "Created PostgreSQL remote table provider: {} (hash: {})",
-        //                 table_ref, query_hash
-        //             );
-        //
-        //             // Create a DefaultTableSource wrapper for the remote provider
-        //             let table_source = Arc::new(
-        //                 DefaultTableSource::new(provider)
-        //             );
-        //             let table_source = table_source as Arc<dyn datafusion::logical_expr::TableSource>;
-        //
-        //             // Create a TableScan using the remote table source
-        //             let table_scan = logical_plan::TableScan::try_new(
-        //                 table_ref,
-        //                 table_source,
-        //                 None,
-        //                 vec![],
-        //                 None,
-        //             )
-        //             .whatever_context("failed to create remote TableScan")?;
-        //
-        //             Ok(DFLogicalPlan::TableScan(table_scan))
-        //         } else {
-        //             tracing::debug!("PostgreSQL connection not configured (set OPTD_POSTGRES_URL) - passing through to local execution");
-        //             Ok(input)
-        //         }
-        //     }
-        //     Location::Local | Location::Any => {
-        //         // No remoting needed for local execution
-        //         Ok(input)
-        //     }
-        // }
+    /// Attempts to unwrap a [`TableSource`] to its inner [`FederatedTableProviderAdaptor`].
+    ///
+    /// Tables created via [`SqliteTableProviderFactory`] (i.e. `CREATE EXTERNAL TABLE … STORED AS
+    /// SQLITE`) are registered as [`SqliteTableWriter`] providers. Their `read_provider` field is
+    /// a `FederatedTableProviderAdaptor` (when the `sqlite-federation` feature is enabled).
+    ///
+    /// Returning the inner adaptor as the `TableScan` source ensures that
+    /// `datafusion_federation::gather_analyzers` can locate the `SQLTableSource` for SQL
+    /// generation, while `scan()` still works because `FederatedTableProviderAdaptor` delegates
+    /// to the wrapped `SQLiteTable`.
+    fn unwrap_to_federated_source(
+        source: &Arc<dyn logical_expr::TableSource>,
+    ) -> Option<Arc<dyn logical_expr::TableSource>> {
+        let provider = source_as_provider(source).ok()?;
+        let writer = provider
+            .as_any()
+            .downcast_ref::<SqliteTableWriter>()?;
+        Some(provider_as_source(Arc::clone(&writer.read_provider)))
     }
 
     pub fn try_from_optd_get(&mut self, node: GetBorrowed<'_>) -> Result<DFLogicalPlan> {
@@ -399,10 +394,16 @@ impl OptdQueryPlannerContext<'_> {
             .get(&name)
             .whatever_context("table source not found")?;
 
+        // Use the inner FederatedTableProviderAdaptor when the table was created via
+        // SqliteTableProviderFactory, so that datafusion-federation's gather_analyzers
+        // can find the SQLTableSource for SQL generation inside VirtualExecutionPlan.
+        let table_source = Self::unwrap_to_federated_source(table_source)
+            .unwrap_or_else(|| Arc::clone(table_source));
+
         let projections = (!node.projections().is_empty())
             .then(|| node.projections().iter().cloned().collect_vec());
         let table_scan =
-            logical_plan::TableScan::try_new(name, table_source.clone(), projections, vec![], None)
+            logical_plan::TableScan::try_new(name, table_source, projections, vec![], None)
                 .whatever_context("failed to create TableScan")?;
         Ok(DFLogicalPlan::TableScan(table_scan))
     }
@@ -446,7 +447,7 @@ mod tests {
             create_optd_session_context(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
         let session_state = session_ctx.state();
         let inner = OptdQueryPlanner::create_context(&session_state).unwrap();
-        let ctx = OptdQueryPlannerContext::new(inner.clone(), &session_state);
+        let ctx = OptdQueryPlannerContext::new(inner.clone(), &session_state, );
 
         let input_schema = Arc::new(Schema::new(vec![
             Field::new("l_extendedprice", DataType::Int64, false),
@@ -493,7 +494,7 @@ mod tests {
             create_optd_session_context(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
         let session_state = session_ctx.state();
         let inner = OptdQueryPlanner::create_context(&session_state).unwrap();
-        let ctx = OptdQueryPlannerContext::new(inner.clone(), &session_state);
+        let ctx = OptdQueryPlannerContext::new(inner.clone(), &session_state, );
 
         let input_schema = Arc::new(Schema::new(vec![
             Field::new("l_returnflag", DataType::Utf8, false),

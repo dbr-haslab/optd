@@ -18,6 +18,7 @@ use datafusion::{
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
     sql::TableReference,
 };
+use datafusion_federation::FederatedPlanner;
 use optd_core::{
     cascades::Cascades,
     error::CatalogSnafu,
@@ -277,8 +278,13 @@ impl OptdQueryPlanner {
                 e => DataFusionError::External(e.into()),
             })?;
 
-        let physical_plan = self
-            .default
+        // Use a physical planner that includes the FederatedPlanner extension so it can
+        // lower FederatedPlanNode extensions (produced by try_from_optd_enforcer_location)
+        // into VirtualExecutionPlan nodes that run SQL against the remote SQLite engine.
+        let physical_planner = DefaultPhysicalPlanner::with_extension_planners(vec![
+            Arc::new(FederatedPlanner::new()),
+        ]);
+        let physical_plan = physical_planner
             .create_physical_plan(&logical_plan, session_state)
             .await?;
 
