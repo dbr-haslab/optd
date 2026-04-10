@@ -5,6 +5,7 @@ pub use arrow_schema::Field;
 pub use arrow_schema::Schema;
 pub use arrow_schema::SchemaRef;
 use snafu::prelude::*;
+use std::sync::Arc;
 
 use crate::ir::{
     properties::ExecutionLocation,
@@ -115,4 +116,12 @@ pub trait Catalog: Send + Sync + 'static {
     /// catalog and schema. Returns [`CatalogError::TableNotFound`] when the table is
     /// unknown.
     fn set_table_statistics(&self, table: TableRef, stats: TableStatistics) -> Result<()>;
+
+    /// Returns the distinct connection strings for all remote engines known to the catalog.
+    ///
+    /// Used by the enforcer rules to enumerate the remote engines to consider during
+    /// optimization.  The default implementation returns an empty list (no remote engines).
+    fn list_remote_locations(&self) -> Result<Vec<Arc<str>>> {
+        Ok(vec![])
+    }
 }

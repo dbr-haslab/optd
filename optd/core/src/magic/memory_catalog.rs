@@ -146,6 +146,24 @@ impl Catalog for MemoryCatalog {
         table.statistics = Some(stats);
         Ok(())
     }
+
+    fn list_remote_locations(&self) -> Result<Vec<Arc<str>>> {
+        let reader = self.inner.read().unwrap();
+        let mut seen = std::collections::HashSet::new();
+        let locations = reader
+            .tables
+            .values()
+            .filter_map(|meta| {
+                if let Location::Remote(cs) = &meta.location {
+                    if seen.insert(Arc::clone(cs)) {
+                        return Some(Arc::clone(cs));
+                    }
+                }
+                None
+            })
+            .collect();
+        Ok(locations)
+    }
 }
 
 #[cfg(test)]

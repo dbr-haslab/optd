@@ -105,7 +105,7 @@ impl Explain for GetBorrowed<'_> {
         fields.push((".data_source_id", Pretty::display(&self.data_source_id().0)));
         fields.push((".table_index", Pretty::display(&self.table_index())));
         fields.push((".implementation", Pretty::debug(self.implementation())));
-        fields.push((".location", Pretty::debug(&self.get_location(ctx))));
+        fields.push((".location", Pretty::debug(&self.get_location(ctx).unwrap().location())));
         fields.extend(self.common.explain_operator_properties(ctx, option));
         Pretty::childless_record("Get", fields)
     }

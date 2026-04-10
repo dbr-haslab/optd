@@ -9,15 +9,21 @@ use crate::ir::operator::*;
 use crate::ir::{Operator, OperatorCategory, OperatorKind};
 
 /// Specifies where an operator should be executed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+///
+/// `Remote(cs)` carries a *connection-string* that uniquely identifies the remote
+/// engine (e.g. the SQLite file path).  Two tables are on the same engine only
+/// when their connection strings compare equal.  This allows the optimizer to
+/// group same-engine tables into a single federated SQL statement while keeping
+/// cross-engine operations local.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum Location {
     /// Default/unspecified location (usually means any location)
     Any,
     /// Local execution engine
     #[default]
     Local,
-    /// Remote SQL execution engine
-    Remote,
+    /// Remote SQL execution engine identified by `cs` (connection string).
+    Remote(Arc<str>),
 }
 
 impl std::fmt::Display for Location {
@@ -25,7 +31,7 @@ impl std::fmt::Display for Location {
         match self {
             Location::Any => write!(f, "Any"),
             Location::Local => write!(f, "Local"),
-            Location::Remote => write!(f, "Remote"),
+            Location::Remote(cs) => write!(f, "Remote({cs})"),
         }
     }
 }
@@ -50,11 +56,12 @@ impl ExecutionLocation {
     }
 
     pub fn matches(&self, other: &ExecutionLocation) -> bool {
-        self.0 == other.0 || self.0 == Location::Any || other.0 == Location::Any
+        self == other || self.0 == Location::Any || other.0 == Location::Any
     }
 
-    pub fn location(&self) -> Location {
-        self.0
+    /// Returns a reference to the underlying [`Location`].
+    pub fn location(&self) -> &Location {
+        &self.0
     }
 }
 
@@ -131,6 +138,7 @@ impl crate::ir::properties::TrySatisfy<ExecutionLocation> for Operator {
             OperatorKind::Limit(meta) => {
                 let limit = Limit::borrow_raw_parts(meta, &self.common);
                 satisfy_passthrough_location(limit.input(), location, ctx)?
+                //Some(Arc::from(vec![ExecutionLocation(Location::Local)]))
             }
             OperatorKind::OrderBy(meta) => {
                 let order_by = OrderBy::borrow_raw_parts(meta, &self.common);
@@ -139,6 +147,7 @@ impl crate::ir::properties::TrySatisfy<ExecutionLocation> for Operator {
             OperatorKind::Aggregate(meta) => {
                 let agg = Aggregate::borrow_raw_parts(meta, &self.common);
                 satisfy_passthrough_location(agg.input(), location, ctx)?
+                //Some(Arc::from(vec![ExecutionLocation(Location::Local)]))
             }
             OperatorKind::Remap(meta) => {
                 let remap = Remap::borrow_raw_parts(meta, &self.common);
@@ -153,9 +162,27 @@ impl crate::ir::properties::TrySatisfy<ExecutionLocation> for Operator {
                 Some(Arc::from(vec![location.clone()]))
             }
             OperatorKind::EnforcerLocation(meta) => {
-                // EnforcerLocation enforces the location; only satisfies if it matches
-                (&meta.location == location)
-                    .then(|| Arc::from(vec![ExecutionLocation(Location::Remote)]))
+                match &meta.location.0 {
+                    // A Remote(cs) enforcer materialises the remote sub-plan locally.
+                    // It satisfies Local, Any, or an exact Remote(cs) match, and always
+                    // requires its child to execute at that same Remote(cs).
+                    Location::Remote(cs) => {
+                        let satisfies = location.0 == Location::Local
+                            || location.0 == Location::Any
+                            || &meta.location == location;
+                        satisfies.then(|| {
+                            Arc::from(vec![ExecutionLocation::new(Location::Remote(cs.clone()))])
+                        })
+                    }
+                    // A Local enforcer is a pure pass-through; it satisfies Local and Any
+                    // and places no location constraint on its child.
+                    Location::Local => {
+                        let satisfies =
+                            location.0 == Location::Local || location.0 == Location::Any;
+                        satisfies.then(|| Arc::from(vec![ExecutionLocation::any()]))
+                    }
+                    Location::Any => None,
+                }
             }
         };
         Ok(satisfied)
@@ -170,13 +197,18 @@ mod tests {
         table_ref::TableRef, test_utils::test_ctx_with_tables, ScalarValue,
     };
 
+    fn remote(cs: &str) -> ExecutionLocation {
+        ExecutionLocation::new(Location::Remote(Arc::from(cs)))
+    }
+
     #[test]
     fn location_matches() {
         assert!(ExecutionLocation::any().matches(&ExecutionLocation::new(Location::Local)));
         assert!(ExecutionLocation::new(Location::Local)
             .matches(&ExecutionLocation::new(Location::Local)));
-        assert!(!ExecutionLocation::new(Location::Local)
-            .matches(&ExecutionLocation::new(Location::Remote)));
+        assert!(!ExecutionLocation::new(Location::Local).matches(&remote("db")));
+        assert!(!remote("db1").matches(&remote("db2")));
+        assert!(remote("db").matches(&remote("db")));
     }
 
     #[test]
@@ -200,22 +232,42 @@ mod tests {
         let ctx = test_ctx_with_tables(&[("t1", 2)])?;
         let t1 = ctx.logical_get(TableRef::bare("t1"), None)?.build();
 
-        let enforcer_location = ExecutionLocation::new(Location::Remote);
-        let enforcer = EnforcerLocation::new(enforcer_location.clone(), t1.clone())
-            .into_operator();
+        // --- Remote(cs) enforcer ---
+        let remote_enforcer =
+            EnforcerLocation::new(remote("db1"), t1.clone()).into_operator();
 
-        // Should satisfy exact match
-        let res = enforcer.try_satisfy(&enforcer_location, &ctx)?.unwrap();
+        // Satisfies exact Remote(db1)
+        let res = remote_enforcer.try_satisfy(&remote("db1"), &ctx)?.unwrap();
+        assert_eq!(res.as_ref()[0], remote("db1"));
+
+        // Satisfies Local (materialises data locally)
+        let res = remote_enforcer
+            .try_satisfy(&ExecutionLocation::new(Location::Local), &ctx)?
+            .unwrap();
+        assert_eq!(res.as_ref()[0], remote("db1"));
+
+        // Satisfies Any
+        let res = remote_enforcer
+            .try_satisfy(&ExecutionLocation::any(), &ctx)?
+            .unwrap();
+        assert_eq!(res.as_ref()[0], remote("db1"));
+
+        // Does not satisfy a different Remote engine
+        assert_eq!(None, remote_enforcer.try_satisfy(&remote("db2"), &ctx)?);
+
+        // --- Local (pass-through) enforcer ---
+        let local_enforcer =
+            EnforcerLocation::new(ExecutionLocation::new(Location::Local), t1.clone())
+                .into_operator();
+
+        // Satisfies Local
+        let res = local_enforcer
+            .try_satisfy(&ExecutionLocation::new(Location::Local), &ctx)?
+            .unwrap();
         assert_eq!(res.as_ref()[0], ExecutionLocation::any());
 
-        // Should satisfy when requirement is Any
-        let any_location = ExecutionLocation::any();
-        let res = enforcer.try_satisfy(&any_location, &ctx)?.unwrap();
-        assert_eq!(res.as_ref()[0], ExecutionLocation::any());
-
-        // Should not satisfy different location
-        let different = ExecutionLocation::new(Location::Local);
-        assert_eq!(None, enforcer.try_satisfy(&different, &ctx)?);
+        // Does not satisfy Remote
+        assert_eq!(None, local_enforcer.try_satisfy(&remote("db1"), &ctx)?);
 
         Ok(())
     }

@@ -325,7 +325,6 @@ impl OptdQueryPlannerContext<'_> {
                 .downcast_ref::<FederatedTableProviderAdaptor>()
             {
                 if let Some(sql_source) = adaptor.source.as_any().downcast_ref::<SQLTableSource>() {
-                    println!("------- Found SQLTableSource inside SqliteTableWriter's read_provider");
                     return Some(Arc::clone(&sql_source.provider.executor));
                 }
             }
@@ -342,23 +341,38 @@ impl OptdQueryPlannerContext<'_> {
 
         let input = self.try_from_optd_plan(node.input())?;
 
-        // Extract an SQLExecutor from any SQLite-backed table source in this plan.
-        // All Remote tables share the same SQLite connection context, so any one
-        // executor is sufficient to drive the federated sub-plan.
-        let executor = self
-            .table_reference_to_source
-            .values()
-            .find_map(Self::extract_sql_executor)
-            .whatever_context(
-                "no SQLite-backed table source found to create federation planner",
-            )?;
+        match node.location().location() {
+            Location::Remote(cs) => {
+                // Find the executor whose compute_context() matches the connection string
+                // stored in the enforcer.  This selects the correct SQLite connection
+                // pool when multiple remote engines are registered.
+                let executor = self
+                    .table_reference_to_source
+                    .values()
+                    .find_map(|source| {
+                        let exec = Self::extract_sql_executor(source)?;
+                        if exec.compute_context().as_deref() == Some(cs.as_ref()) {
+                            Some(exec)
+                        } else {
+                            None
+                        }
+                    })
+                    .whatever_context(
+                        "no SQLite-backed table source matching the remote connection string",
+                    )?;
 
-        let planner = SQLFederationPlanner::new(executor);
-        let fed_plan = FederatedPlanNode::new(input, Arc::new(planner));
-        let ext_node = Extension {
-            node: Arc::new(fed_plan),
-        };
-        Ok(DFLogicalPlan::Extension(ext_node))
+                let planner = SQLFederationPlanner::new(executor);
+                let fed_plan = FederatedPlanNode::new(input, Arc::new(planner));
+                let ext_node = Extension {
+                    node: Arc::new(fed_plan),
+                };
+                Ok(DFLogicalPlan::Extension(ext_node))
+            }
+            Location::Local | Location::Any => {
+                // No remoting needed; pass the plan through for local DataFusion execution.
+                Ok(input)
+            }
+        }
     }
 
     /// Attempts to unwrap a [`TableSource`] to its inner [`FederatedTableProviderAdaptor`].
