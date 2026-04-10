@@ -1,8 +1,6 @@
-use bitvec::macros::internal::funty::Fundamental;
 use crate::ir::{
     cost::{Cost, CostModel},
     operator::*,
-    properties::Location,
     scalar::List,
 };
 use snafu::whatever;
@@ -54,8 +52,8 @@ impl MagicCostModel {
         input_card: crate::ir::properties::Cardinality,
         num_cols: usize,
     ) -> Cost {
-        // FIXME(jop): Should know the source location
-        (Self::REMOTING_CONSTANT_PENALTY + input_card.as_f64() * num_cols.as_f64() * Self::REMOTING_FACTOR) * Cost::UNIT
+        // Could use the input location...
+        (Self::REMOTING_CONSTANT_PENALTY + input_card.as_f64() * (num_cols as f64) * Self::REMOTING_FACTOR) * Cost::UNIT
     }
 }
 

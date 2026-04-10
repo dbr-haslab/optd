@@ -7,7 +7,6 @@ use crate::{
     ir::{
         Column, DataType, IRContext,
         catalog::{Catalog, Field, Schema},
-        properties::{ExecutionLocation, Location},
         table_ref::TableRef,
     },
     magic::MemoryCatalog,

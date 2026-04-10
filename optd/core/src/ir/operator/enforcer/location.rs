@@ -17,7 +17,8 @@ define_node!(
     EnforcerLocation, EnforcerLocationBorrowed {
         properties: OperatorProperties,
         metadata: EnforcerLocationMetadata {
-            location: ExecutionLocation,
+            output_location: ExecutionLocation,
+            input_location: ExecutionLocation,
         },
         inputs: {
             operators: [input],
@@ -28,9 +29,9 @@ define_node!(
 impl_operator_conversion!(EnforcerLocation, EnforcerLocationBorrowed);
 
 impl EnforcerLocation {
-    pub fn new(location: ExecutionLocation, input: Arc<Operator>) -> Self {
+    pub fn new(output_location: ExecutionLocation, input_location: ExecutionLocation, input: Arc<Operator>) -> Self {
         Self {
-            meta: EnforcerLocationMetadata { location },
+            meta: EnforcerLocationMetadata { output_location, input_location },
             common: IRCommon::with_input_operators_only(Arc::new([input])),
         }
     }
@@ -42,8 +43,9 @@ impl Explain for EnforcerLocationBorrowed<'_> {
         ctx: &crate::ir::IRContext,
         option: &crate::ir::explain::ExplainOption,
     ) -> Pretty<'a> {
-        let mut fields = Vec::with_capacity(1);
-        fields.push((".location", Pretty::display(self.location())));
+        let mut fields = Vec::with_capacity(2);
+        fields.push((".output_location", Pretty::display(self.output_location())));
+        fields.push((".input_location", Pretty::display(self.input_location())));
 
         let metadata = self.common.explain_operator_properties(ctx, option);
         fields.extend(metadata);

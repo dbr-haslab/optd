@@ -162,27 +162,10 @@ impl crate::ir::properties::TrySatisfy<ExecutionLocation> for Operator {
                 Some(Arc::from(vec![location.clone()]))
             }
             OperatorKind::EnforcerLocation(meta) => {
-                match &meta.location.0 {
-                    // A Remote(cs) enforcer materialises the remote sub-plan locally.
-                    // It satisfies Local, Any, or an exact Remote(cs) match, and always
-                    // requires its child to execute at that same Remote(cs).
-                    Location::Remote(cs) => {
-                        let satisfies = location.0 == Location::Local
-                            || location.0 == Location::Any
-                            || &meta.location == location;
-                        satisfies.then(|| {
-                            Arc::from(vec![ExecutionLocation::new(Location::Remote(cs.clone()))])
-                        })
-                    }
-                    // A Local enforcer is a pure pass-through; it satisfies Local and Any
-                    // and places no location constraint on its child.
-                    Location::Local => {
-                        let satisfies =
-                            location.0 == Location::Local || location.0 == Location::Any;
-                        satisfies.then(|| Arc::from(vec![ExecutionLocation::any()]))
-                    }
-                    Location::Any => None,
-                }
+                // EnforcerLocation enforces the location; only satisfies if it matches
+                // demands the correct input
+                (&meta.output_location == location)
+                    .then(|| Arc::from(vec![meta.input_location.clone()]))
             }
         };
         Ok(satisfied)

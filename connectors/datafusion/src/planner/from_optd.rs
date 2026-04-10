@@ -1,7 +1,6 @@
 use std::{sync::Arc, vec};
 
 use datafusion::{
-    catalog::default_table_source::DefaultTableSource,
     common::{Column, DFSchema},
     execution::FunctionRegistry,
     logical_expr::{
@@ -35,6 +34,7 @@ use optd_core::ir::{
     table_ref::TableRef,
 };
 use snafu::{OptionExt, ResultExt, whatever};
+
 use crate::planner::{DataFusionSnafu, OptdQueryPlannerContext, OptdSnafu, Result};
 
 impl OptdQueryPlannerContext<'_> {
@@ -341,7 +341,7 @@ impl OptdQueryPlannerContext<'_> {
 
         let input = self.try_from_optd_plan(node.input())?;
 
-        match node.location().location() {
+        match node.input_location().location() {
             Location::Remote(cs) => {
                 // Find the executor whose compute_context() matches the connection string
                 // stored in the enforcer.  This selects the correct SQLite connection
@@ -368,7 +368,7 @@ impl OptdQueryPlannerContext<'_> {
                 };
                 Ok(DFLogicalPlan::Extension(ext_node))
             }
-            Location::Local | Location::Any => {
+            _ => {
                 // No remoting needed; pass the plan through for local DataFusion execution.
                 Ok(input)
             }
@@ -461,7 +461,7 @@ mod tests {
             create_optd_session_context(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
         let session_state = session_ctx.state();
         let inner = OptdQueryPlanner::create_context(&session_state).unwrap();
-        let ctx = OptdQueryPlannerContext::new(inner.clone(), &session_state, );
+        let ctx = OptdQueryPlannerContext::new(inner.clone(), &session_state);
 
         let input_schema = Arc::new(Schema::new(vec![
             Field::new("l_extendedprice", DataType::Int64, false),
@@ -508,7 +508,7 @@ mod tests {
             create_optd_session_context(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
         let session_state = session_ctx.state();
         let inner = OptdQueryPlanner::create_context(&session_state).unwrap();
-        let ctx = OptdQueryPlannerContext::new(inner.clone(), &session_state, );
+        let ctx = OptdQueryPlannerContext::new(inner.clone(), &session_state);
 
         let input_schema = Arc::new(Schema::new(vec![
             Field::new("l_returnflag", DataType::Utf8, false),

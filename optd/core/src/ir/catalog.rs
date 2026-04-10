@@ -8,7 +8,6 @@ use snafu::prelude::*;
 use std::sync::Arc;
 
 use crate::ir::{
-    properties::ExecutionLocation,
     statistics::TableStatistics,
     table_ref::{ResolvedTableRef, TableRef},
 };

@@ -129,22 +129,7 @@ impl OptdSessionContext {
             match ddl {
                 DdlStatement::CreateExternalTable(create_table) => {
                     let location = match create_table.file_type.as_str() {
-                        "SQLITE" => {
-                            // Compute the same file-path identity that SqliteConnectionPool
-                            // uses as its join-push-down context (= compute_context()).
-                            // Mirrors SqliteTableProviderFactory::sqlite_file_path.
-                            let options = &create_table.options;
-                            let data_dir = options
-                                .get("data_directory")
-                                .cloned()
-                                .unwrap_or_else(|| ".".to_string());
-                            let default_path = format!(
-                                "{data_dir}/{name}_sqlite.db",
-                                name = create_table.name.table()
-                            );
-                            let path = options.get("file").cloned().unwrap_or(default_path);
-                            Location::Remote(Arc::from(path.as_str()))
-                        }
+                        "SQLITE" => Location::Remote(Arc::from("memory")),
                         _ => Location::Local,
                     };
                     self.create_table(

@@ -66,27 +66,18 @@ impl Rule for EnforceExecutionLocationRule {
         ctx: &crate::ir::IRContext,
     ) -> crate::error::Result<Vec<Arc<crate::ir::Operator>>> {
         // Enforcers are only generated when the required location is Local.
-        // We produce:
-        //  1. A Local (pass-through) enforcer – child executes in any location.
-        //  2. One Remote(cs) enforcer per known remote engine – child must run on
+        // We produce one Remote(cs) enforcer per known remote engine – child must run on
         //     that engine and results are materialised locally.
         // Cascades will pick the cheapest alternative.
         if self.location.0 != crate::ir::properties::Location::Local {
             return Ok(vec![]);
         }
 
-        let mut enforcers = vec![
-            EnforcerLocation::new(self.location.clone(), Arc::new(operator.clone()))
-                .into_operator(),
-        ];
-
         let remote_locations = ctx.catalog.list_remote_locations().context(CatalogSnafu)?;
-        for cs in remote_locations {
-            let loc = ExecutionLocation::new(crate::ir::properties::Location::Remote(cs));
-            enforcers.push(
-                EnforcerLocation::new(loc, Arc::new(operator.clone())).into_operator(),
-            );
-        }
+        let enforcers = remote_locations.iter().map(|cs| {
+            let loc = ExecutionLocation::new(crate::ir::properties::Location::Remote(cs.clone()));
+            EnforcerLocation::new(self.location.clone(), loc, Arc::new(operator.clone())).into_operator()
+        }).collect();
 
         Ok(enforcers)
     }
