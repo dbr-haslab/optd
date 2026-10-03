@@ -97,6 +97,8 @@ pub enum OperatorData {
     /// Renames the output of its input under a new qualifier.
     /// Corresponds to SQL `(subquery) AS alias` or `table AS alias`.
     Rename(Rename),
+    /// Runs its input at a remote source and transfers the rows locally.
+    Remote(Remote),
     /// Produces constant rows from literal expressions.
     ConstScan(ConstScan),
 }
@@ -167,6 +169,10 @@ impl OperatorData {
             }
             OperatorData::Scan(operator) => OperatorData::Scan(operator),
             OperatorData::TableFunction(operator) => OperatorData::TableFunction(operator),
+            OperatorData::Remote(mut operator) => {
+                operator.input = f(operator.input)?;
+                OperatorData::Remote(operator)
+            }
             OperatorData::ConstScan(operator) => OperatorData::ConstScan(operator),
         })
     }
@@ -324,6 +330,18 @@ pub struct Output {
 pub struct Rename {
     pub alias: String,
     pub defs: Vec<(Column, Column)>,
+    pub input: Operator,
+}
+
+/// Marks a subtree that runs entirely at one remote source.
+///
+/// Rows cross from the source to the local engine at this node. It is relationally
+/// transparent: its output equals its input's.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Remote {
+    /// Source executing `input`; every table scanned below has this location.
+    pub source: SourceId,
     pub input: Operator,
 }
 
@@ -1687,6 +1705,7 @@ impl<'a> QueryFormatter<'a> {
             OperatorData::Projection(_)
             | OperatorData::Output(_)
             | OperatorData::Rename(_)
+            | OperatorData::Remote(_)
             | OperatorData::ConstScan(_) => {}
         }
         inputs
@@ -1833,6 +1852,7 @@ impl Relation for OperatorData {
             Self::Projection(operator) => operator.inputs(),
             Self::Output(operator) => operator.inputs(),
             Self::Rename(operator) => operator.inputs(),
+            Self::Remote(operator) => operator.inputs(),
             Self::ConstScan(operator) => operator.inputs(),
         }
     }
@@ -1853,6 +1873,7 @@ impl OperatorDisplayFormat for OperatorData {
             Self::Projection(operator) => operator.format(formatter),
             Self::Output(operator) => operator.format(formatter),
             Self::Rename(operator) => operator.format(formatter),
+            Self::Remote(operator) => operator.format(formatter),
             Self::ConstScan(operator) => operator.format(formatter),
         }
     }
@@ -2159,6 +2180,26 @@ impl OperatorDisplayFormat for Output {
             kind: "output".to_string(),
             title: "= Output".to_string(),
             fields: Vec::new(),
+            inputs: vec![OperatorDisplayInput {
+                name: "input".to_string(),
+                target: self.input,
+            }],
+        }
+    }
+}
+
+impl Relation for Remote {
+    fn inputs(&self) -> Vec<Operator> {
+        vec![self.input]
+    }
+}
+
+impl OperatorDisplayFormat for Remote {
+    fn format(&self, _formatter: &QueryFormatter<'_>) -> OperatorDisplay {
+        OperatorDisplay {
+            kind: "remote".to_string(),
+            title: "⇡ Remote".to_string(),
+            fields: vec![display_scalar_field("source", self.source.0.as_ref())],
             inputs: vec![OperatorDisplayInput {
                 name: "input".to_string(),
                 target: self.input,

@@ -788,7 +788,8 @@ fn directly_created_columns(operator: &OperatorData) -> Vec<Column> {
         | OperatorData::Sort(_)
         | OperatorData::Limit(_)
         | OperatorData::Projection(_)
-        | OperatorData::Output(_) => Vec::new(),
+        | OperatorData::Output(_)
+        | OperatorData::Remote(_) => Vec::new(),
         OperatorData::ConstScan(operator) => operator.columns.clone(),
         OperatorData::Rename(r) => r.defs.iter().map(|(renamed, _)| *renamed).collect(),
     }
@@ -845,6 +846,9 @@ fn directly_used_columns(
             columns.extend(analyses.get::<AvailableColumns>(ctx, data.input)?);
         }
         OperatorData::Rename(_) => {} // no expressions — column mapping only
+        OperatorData::Remote(data) => {
+            columns.extend(analyses.get::<AvailableColumns>(ctx, data.input)?);
+        }
     }
 
     Ok(columns)
@@ -925,6 +929,12 @@ fn input_available_columns(
             extend_unique_columns(
                 &mut columns,
                 analyses.get::<AvailableColumns>(ctx, r.input)?,
+            );
+        }
+        OperatorData::Remote(data) => {
+            extend_unique_columns(
+                &mut columns,
+                analyses.get::<AvailableColumns>(ctx, data.input)?,
             );
         }
     }
@@ -1264,6 +1274,7 @@ fn output_column_nullability(
                 })
                 .collect())
         }
+        OperatorData::Remote(data) => analyses.get::<ColumnNullability>(ctx, data.input),
     }
 }
 
@@ -1335,6 +1346,7 @@ impl CachedAnalysis for AtMostOneRow {
                 }
                 JoinType::FullOuter => false,
             },
+            OperatorData::Remote(data) => analyses.get::<Self>(ctx, data.input)?,
         };
         Ok(at_most_one)
     }
@@ -1492,6 +1504,9 @@ fn cardinality_profile(
                 ctx,
                 &config,
             )))
+        }
+        OperatorData::Remote(data) => {
+            CardinalityEstimationV1::get_shared(ctx, analyses, data.input)
         }
     }
 }
@@ -2913,6 +2928,7 @@ impl CachedAnalysis for AvailableColumns {
                 analyses.get::<AvailableColumns>(ctx, r.input)?;
                 Ok(r.defs.iter().map(|(renamed, _)| *renamed).collect())
             }
+            OperatorData::Remote(data) => analyses.get::<AvailableColumns>(ctx, data.input),
         }
     }
 }
@@ -3042,8 +3058,9 @@ mod tests {
     use super::*;
     use crate::{
         AggregateExpr, AggregateFunction, Aggregation, BinaryOp, Catalog, ColumnData, ExprData,
-        Join, JoinType, Limit, Map, MemoryCatalog, OperatorData, Output, Projection, ScalarValue,
-        Scan, Selection, TableFunction, TableFunctionDef, TableRef, TableStatistics,
+        Join, JoinType, Limit, Map, MemoryCatalog, OperatorData, Output, Projection, Remote,
+        ScalarValue, Scan, Selection, SourceId, TableFunction, TableFunctionDef, TableRef,
+        TableStatistics,
     };
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
@@ -5512,6 +5529,49 @@ mod tests {
                 EstimateSource::Default
             );
         }
+    }
+
+    #[test]
+    fn remote_is_transparent_to_analyses() {
+        let catalog = Arc::new(MemoryCatalog::new("memory", "public"));
+        catalog
+            .create_table(TableRef::bare("users"), schema(), None)
+            .unwrap();
+        let mut ctx = QueryContext::new();
+        let scan = ctx
+            .add_scan_from_catalog(catalog.as_ref(), TableRef::bare("users"))
+            .unwrap();
+        let remote = OperatorData::Remote(Remote {
+            source: SourceId("pg/db1".into()),
+            input: scan,
+        })
+        .add(&mut ctx);
+        let mut analyses = AnalysisContext::new(catalog);
+
+        assert_eq!(
+            analyses.get::<AvailableColumns>(&ctx, remote).unwrap(),
+            analyses.get::<AvailableColumns>(&ctx, scan).unwrap()
+        );
+        assert_eq!(
+            analyses.get::<ColumnNullability>(&ctx, remote).unwrap(),
+            analyses.get::<ColumnNullability>(&ctx, scan).unwrap()
+        );
+        assert_eq!(
+            analyses.get::<AtMostOneRow>(&ctx, remote).unwrap(),
+            analyses.get::<AtMostOneRow>(&ctx, scan).unwrap()
+        );
+        assert_eq!(
+            analyses
+                .get::<CardinalityEstimationV1>(&ctx, remote)
+                .unwrap(),
+            analyses.get::<CardinalityEstimationV1>(&ctx, scan).unwrap()
+        );
+        assert!(
+            analyses
+                .get::<CreatedColumns>(&ctx, remote)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn schema() -> Arc<Schema> {

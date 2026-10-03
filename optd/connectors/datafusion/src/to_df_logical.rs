@@ -564,6 +564,8 @@ fn convert_operator_inner(
 
         OperatorData::TableFunction(_) => Err(ToDFError::Unsupported("TableFunction".into())),
 
+        OperatorData::Remote(_) => Err(ToDFError::Unsupported("Remote".into())),
+
         OperatorData::ConstScan(const_scan) => {
             use datafusion::logical_expr::EmptyRelation;
             let schema = const_scan_schema(&const_scan, ctx)?;

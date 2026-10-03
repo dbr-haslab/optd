@@ -137,6 +137,8 @@ impl CostModel for DefaultCostModel {
                 &output,
                 join_algorithm_class_for_predicate(data.on, ctx),
             )?,
+            // one unit per transferred row; the federation cost model refines this.
+            OperatorData::Remote(_) => output.rows.value,
         })
     }
 }

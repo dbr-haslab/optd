@@ -597,6 +597,8 @@ async fn convert_operator(
         },
 
         OperatorData::TableFunction(_) => Err(ToPhysicalError::Unsupported("TableFunction".into())),
+
+        OperatorData::Remote(_) => Err(ToPhysicalError::Unsupported("Remote".into())),
     }
 }
 
