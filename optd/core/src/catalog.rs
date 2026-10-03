@@ -165,6 +165,14 @@ impl<'de, T: serde::Deserialize<'de>, const MAX: usize> serde::Deserialize<'de>
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TableId(pub usize);
 
+/// Opaque identity of a remote source that executes queries over its tables.
+///
+/// Tables share a source exactly when their `SourceId`s are equal. Connectors define the
+/// identity and map it back to whatever executes queries at that source.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SourceId(pub Arc<str>);
+
 /// Fully qualified table reference.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -973,6 +981,7 @@ pub struct TableMetadata {
     pub schema: SchemaRef,
     pub statistics: Option<TableStatistics>,
     pub definition: Option<String>,
+    pub location: Option<SourceId>,
 }
 
 /// Error produced by catalog lookup or mutation.
@@ -1047,6 +1056,9 @@ pub trait Catalog: Send + Sync + 'static {
         table: TableRef,
         statistics: TableStatistics,
     ) -> CatalogResult<()>;
+
+    /// Records the remote source holding a table.
+    fn set_table_location(&self, table: TableRef, location: SourceId) -> CatalogResult<()>;
 }
 
 /// Deterministic in-memory catalog implementation useful for tests and local planning.
@@ -1080,6 +1092,28 @@ impl MemoryCatalog {
 
     fn resolve_table_ref(&self, table: TableRef) -> ResolvedTableRef {
         table.resolve(&self.default_catalog, &self.default_schema)
+    }
+
+    fn update_table(
+        &self,
+        table: TableRef,
+        update: impl FnOnce(&mut TableMetadata),
+    ) -> CatalogResult<()> {
+        let mut inner = self.inner.write().expect("memory catalog lock poisoned");
+        let resolved = self.resolve_table_ref(table.clone());
+        let Some(id) = inner.table_to_id.get(&resolved).copied() else {
+            return Err(CatalogError::TableNotFound { table });
+        };
+
+        let metadata = inner
+            .tables
+            .get_mut(&id)
+            .ok_or(CatalogError::DanglingTableReference {
+                table: resolved,
+                id,
+            })?;
+        update(metadata);
+        Ok(())
     }
 }
 
@@ -1116,6 +1150,7 @@ impl Catalog for MemoryCatalog {
                 schema,
                 statistics: None,
                 definition,
+                location: None,
             },
         );
         inner.next_table_id += 1;
@@ -1172,21 +1207,11 @@ impl Catalog for MemoryCatalog {
         table: TableRef,
         statistics: TableStatistics,
     ) -> CatalogResult<()> {
-        let mut inner = self.inner.write().expect("memory catalog lock poisoned");
-        let resolved = self.resolve_table_ref(table.clone());
-        let Some(id) = inner.table_to_id.get(&resolved).copied() else {
-            return Err(CatalogError::TableNotFound { table });
-        };
+        self.update_table(table, |metadata| metadata.statistics = Some(statistics))
+    }
 
-        let metadata = inner
-            .tables
-            .get_mut(&id)
-            .ok_or(CatalogError::DanglingTableReference {
-                table: resolved,
-                id,
-            })?;
-        metadata.statistics = Some(statistics);
-        Ok(())
+    fn set_table_location(&self, table: TableRef, location: SourceId) -> CatalogResult<()> {
+        self.update_table(table, |metadata| metadata.location = Some(location))
     }
 }
 
@@ -1271,6 +1296,33 @@ mod tests {
         ));
         assert!(matches!(
             catalog.table_by_ref(&TableRef::bare("users")),
+            Err(CatalogError::TableNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn memory_catalog_records_table_location() {
+        let catalog = MemoryCatalog::new("memory", "public");
+        let id = catalog
+            .create_table(TableRef::bare("users"), schema(), None)
+            .unwrap();
+        assert_eq!(catalog.table(id).unwrap().location, None);
+
+        let source = SourceId("pg/db1".into());
+        catalog
+            .set_table_location(TableRef::partial("public", "users"), source.clone())
+            .unwrap();
+        assert_eq!(catalog.table(id).unwrap().location, Some(source.clone()));
+        assert_eq!(
+            catalog
+                .table_by_ref(&TableRef::bare("users"))
+                .unwrap()
+                .location,
+            Some(source.clone())
+        );
+
+        assert!(matches!(
+            catalog.set_table_location(TableRef::bare("missing"), source),
             Err(CatalogError::TableNotFound { .. })
         ));
     }

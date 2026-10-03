@@ -23,8 +23,8 @@ pub use catalog::{
     ColumnDistributionStatistics, ColumnStatistics, DistributionError, ForeignKey, ForeignKeyError,
     Histogram, HistogramBucket, MAX_HISTOGRAM_BUCKETS, MAX_KEY_COLUMNS, MAX_MOST_COMMON_VALUES,
     MAX_TABLE_KEYS, MemoryCatalog, MostCommonValue, MostCommonValues, NullCountStatistics,
-    ResolvedTableRef, StatisticsCompleteness, StatisticsProvenance, TableConstraints, TableId,
-    TableMetadata, TableRef, TableStatistics, UniqueKey, UniqueKeyError,
+    ResolvedTableRef, SourceId, StatisticsCompleteness, StatisticsProvenance, TableConstraints,
+    TableId, TableMetadata, TableRef, TableStatistics, UniqueKey, UniqueKeyError,
 };
 pub use cost::{CostModel, DefaultCostModel, JoinAlgorithmClass, join_algorithm_cost};
 pub use display::{
