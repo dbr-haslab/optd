@@ -15,6 +15,7 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use optd_core::{Catalog, MemoryCatalog, TableRef, TableStatistics};
 
+use crate::federation::table_location;
 use crate::statistics::collect_table_statistics_for_table_ref;
 
 type RuntimeStatisticsResult<T> = Result<T, String>;
@@ -61,9 +62,22 @@ impl RuntimeStatisticsCatalogBuilder {
             catalog
                 .create_table(table_ref.clone(), provider.schema(), None)
                 .map_err(|e| e.to_string())?;
-            let statistics = self
+            let location = table_location(provider.as_ref());
+            if let Some(location) = location.clone() {
+                catalog
+                    .set_table_location(table_ref.clone(), location)
+                    .map_err(|e| e.to_string())?;
+            }
+            let statistics = match self
                 .cached_table_statistics(&scan.table, provider.as_ref(), &scan.columns)
-                .await?;
+                .await
+            {
+                Ok(statistics) => statistics,
+                // ponytail: remote statistics are stubbed. A remote table without a local fallback
+                // provider cannot be scanned here, so it keeps the estimator's fallback defaults.
+                Err(_) if location.is_some() => continue,
+                Err(error) => return Err(error),
+            };
             catalog
                 .set_table_statistics(table_ref, statistics)
                 .map_err(|e| e.to_string())?;
@@ -149,7 +163,7 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
     use datafusion::prelude::SessionContext;
-    use optd_core::{ScalarValue, TableRef};
+    use optd_core::{ScalarValue, SourceId, TableRef};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -270,5 +284,104 @@ mod tests {
             assert!(catalog.table_by_ref(&TableRef::bare(name)).is_ok());
         }
         assert_eq!(builder.cache_len().await, 3);
+    }
+
+    /// A SQL executor that reports a source identity but never executes anything.
+    struct StubExecutor;
+
+    #[async_trait::async_trait]
+    impl datafusion_federation::sql::SQLExecutor for StubExecutor {
+        fn name(&self) -> &str {
+            "stub"
+        }
+
+        fn compute_context(&self) -> Option<String> {
+            Some("db1".to_string())
+        }
+
+        fn dialect(&self) -> Arc<dyn datafusion::sql::unparser::dialect::Dialect> {
+            Arc::new(datafusion::sql::unparser::dialect::DefaultDialect {})
+        }
+
+        fn execute(
+            &self,
+            _query: &str,
+            _schema: datafusion::arrow::datatypes::SchemaRef,
+            _filters: &[Arc<dyn datafusion::physical_plan::PhysicalExpr>],
+        ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
+            datafusion::common::not_impl_err!("stub executor")
+        }
+
+        async fn table_names(&self) -> datafusion::error::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_table_schema(
+            &self,
+            _table_name: &str,
+        ) -> datafusion::error::Result<datafusion::arrow::datatypes::SchemaRef> {
+            datafusion::common::not_impl_err!("stub executor")
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_tables_get_location_and_fallback_statistics() {
+        use datafusion_federation::FederatedTableProviderAdaptor;
+        use datafusion_federation::sql::{SQLFederationProvider, SQLTableSource};
+
+        let session = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let rows =
+            || Arc::new(MemTable::try_new(schema.clone(), vec![vec![batch.clone()]]).unwrap());
+        let provider = Arc::new(SQLFederationProvider::new(Arc::new(StubExecutor)));
+        let remote_source = |table: &str| {
+            Arc::new(SQLTableSource::new_with_schema(
+                provider.clone(),
+                datafusion::common::TableReference::bare(table).into(),
+                schema.clone(),
+            ))
+        };
+        session.register_table("local_t", rows()).unwrap();
+        session
+            .register_table(
+                "remote_t",
+                Arc::new(FederatedTableProviderAdaptor::new(remote_source(
+                    "remote_t",
+                ))),
+            )
+            .unwrap();
+        session
+            .register_table(
+                "mirrored_t",
+                Arc::new(FederatedTableProviderAdaptor::new_with_provider(
+                    remote_source("mirrored_t"),
+                    rows(),
+                )),
+            )
+            .unwrap();
+        let plan = session
+            .state()
+            .create_logical_plan("SELECT * FROM local_t, remote_t, mirrored_t")
+            .await
+            .unwrap();
+
+        let catalog = RuntimeStatisticsCatalogBuilder::new(session.clone())
+            .build_for_plan(&plan)
+            .await
+            .unwrap();
+        let table = |name: &str| catalog.table_by_ref(&TableRef::bare(name)).unwrap();
+        let db1 = Some(SourceId("stub/db1".into()));
+
+        assert_eq!(table("local_t").location, None);
+        assert_eq!(table("local_t").statistics.unwrap().row_count, Some(3));
+        assert_eq!(table("remote_t").location, db1);
+        assert!(table("remote_t").statistics.is_none());
+        assert_eq!(table("mirrored_t").location, db1);
+        assert_eq!(table("mirrored_t").statistics.unwrap().row_count, Some(3));
     }
 }

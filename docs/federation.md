@@ -34,3 +34,18 @@ runs at its table's location. Any other operator runs at source `s` when it has 
 them run at `s`. `Output`, `Remote`, and inputless operators other than scans run locally. Every
 operator is assumed pushable; per-dialect support checks are future work. Subqueries inside
 expressions are not visited because unnesting removes them earlier.
+
+## DataFusion Connector
+
+The connector depends on `datafusion-federation` 0.5.3, which requires DataFusion 53; upgrade both
+together. `federation::table_location` treats a table as remote when its provider is a
+`FederatedTableProviderAdaptor` over a SQL source whose executor reports a compute context. The
+source is `"{executor name}/{compute context}"`, the identity `datafusion-federation` uses to group
+tables.
+
+When building the per-query catalog, the runtime statistics builder records each table's location.
+Remote statistics are stubbed: if statistics collection fails for a remote table (an adaptor
+without a local fallback provider cannot be scanned), the table is registered without statistics
+and cardinality estimation uses its fallback defaults. An adaptor created with
+`FederatedTableProviderAdaptor::new_with_provider` is scanned through its fallback provider, which
+is how tests give remote tables real statistics.

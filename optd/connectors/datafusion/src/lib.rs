@@ -1,5 +1,6 @@
 pub mod config;
 pub mod explain_udfs;
+pub mod federation;
 pub mod from_df_logical;
 pub mod profiling;
 pub mod runner;
