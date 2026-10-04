@@ -18,7 +18,7 @@ use datafusion_sqllogictest::{
 use optd_core::{
     ExprSimplify, HolisticUnnesting, JoinOrdering, JoinTreeNormalize, MarkJoinToSemiJoin,
     OperatorRewriteAdaptor, OptimizerContext, PassManager, PlannedQuery, PredicatePushdown,
-    ProjectionElimination, QueryContext, QueryFormatConfig, SubqueryToJoin,
+    ProjectionElimination, QueryContext, QueryFormatConfig, RemotePlacement, SubqueryToJoin,
 };
 use sqllogictest::{AsyncDB, DBOutput};
 
@@ -79,6 +79,7 @@ pub fn default_pass_manager() -> PassManager {
     pm.add_pass(JoinTreeNormalize::new());
     pm.add_pass(OperatorRewriteAdaptor::new(ProjectionElimination));
     pm.add_pass(JoinOrdering::new());
+    pm.add_pass(RemotePlacement);
     pm
 }
 
@@ -563,6 +564,19 @@ mod tests {
             .unwrap();
 
         assert_eq!(unnesting, expr_simplify + 1);
+    }
+
+    #[test]
+    fn default_pass_manager_places_remote_regions_last() {
+        let catalog = std::sync::Arc::new(optd_core::MemoryCatalog::new("memory", "public"));
+        let mut opt = optd_core::OptimizerContext::new(optd_core::QueryContext::new(), catalog);
+        let mut pm = super::default_pass_manager();
+        pm.run(&mut opt).unwrap();
+
+        let passes: Vec<_> = pm.profiles().iter().map(|profile| profile.pass).collect();
+        assert_eq!(passes.last(), Some(&"RemotePlacement"));
+        let join_ordering = passes.iter().position(|pass| *pass == "JoinOrdering");
+        assert!(join_ordering < passes.iter().position(|pass| *pass == "RemotePlacement"));
     }
 
     #[tokio::test]

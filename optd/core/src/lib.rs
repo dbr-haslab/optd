@@ -40,7 +40,8 @@ pub use optimize::{
     Direction, ExprSimplify, HolisticUnnesting, JoinOrdering, JoinTreeNormalize,
     MarkJoinToSemiJoin, OperatorRewrite, OperatorRewriteAdaptor, OptimizeError, OptimizeResult,
     Pass, PassManager, PassProfile, PassResult, PassTrace, PredicatePushdown,
-    ProjectionElimination, QueryPass, Rewrite, RewriteMap, SubqueryToJoin, Unnesting,
+    ProjectionElimination, QueryPass, RemotePlacement, Rewrite, RewriteMap, SubqueryToJoin,
+    Unnesting, operator_source,
 };
 
 /// An opaque reference to a relational operator in a [`QueryContext`].

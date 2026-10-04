@@ -21,3 +21,16 @@ from the source to the local engine at this node. It is relationally transparent
 its input's values, and it creates no columns. The default cost model charges one unit per row as a
 placeholder for transfer cost. Substrait export and both DataFusion converters reject it until
 remote lowering is implemented.
+
+## Remote Placement
+
+`RemotePlacement` runs last in the DataFusion pipeline, after join ordering, so markers never split
+join groups. It wraps each maximal single-source subtree in a `Remote` marker. Every remote scan
+ends up under exactly one marker, and markers never nest. A query without located tables is left
+unchanged.
+
+`operator_source` is the pushdown rule shared by placement and, later, federated costing. A scan
+runs at its table's location. Any other operator runs at source `s` when it has inputs and all of
+them run at `s`. `Output`, `Remote`, and inputless operators other than scans run locally. Every
+operator is assumed pushable; per-dialect support checks are future work. Subqueries inside
+expressions are not visited because unnesting removes them earlier.

@@ -73,6 +73,7 @@ At the time of writing, `default_pass_manager` registers:
 6. `JoinTreeNormalize`
 7. `ProjectionElimination`
 8. `JoinOrdering`
+9. `RemotePlacement`
 
 Do not duplicate this list in operational instructions; it changes as the optimizer evolves. Update
 this section when the architecture changes, while treating `default_pass_manager` as canonical.

@@ -136,6 +136,7 @@ ORDER BY step;
 6	JoinTreeNormalize	unchanged
 7	ProjectionElimination	unchanged
 8	JoinOrdering	unchanged
+9	RemotePlacement	unchanged
 
 query T
 SELECT pass
