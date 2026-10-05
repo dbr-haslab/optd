@@ -163,7 +163,7 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
     use datafusion::prelude::SessionContext;
-    use optd_core::{ScalarValue, SourceId, TableRef};
+    use optd_core::{ScalarValue, TableRef};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -284,49 +284,5 @@ mod tests {
             assert!(catalog.table_by_ref(&TableRef::bare(name)).is_ok());
         }
         assert_eq!(builder.cache_len().await, 3);
-    }
-
-    #[tokio::test]
-    async fn remote_tables_get_location_and_fallback_statistics() {
-        use crate::federation::test_support::remote_table;
-
-        let session = SessionContext::new();
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
-        )
-        .unwrap();
-        let rows =
-            || Arc::new(MemTable::try_new(schema.clone(), vec![vec![batch.clone()]]).unwrap());
-        session.register_table("local_t", rows()).unwrap();
-        session
-            .register_table("remote_t", remote_table("remote_t", schema.clone(), None))
-            .unwrap();
-        session
-            .register_table(
-                "mirrored_t",
-                remote_table("mirrored_t", schema.clone(), Some(rows())),
-            )
-            .unwrap();
-        let plan = session
-            .state()
-            .create_logical_plan("SELECT * FROM local_t, remote_t, mirrored_t")
-            .await
-            .unwrap();
-
-        let catalog = RuntimeStatisticsCatalogBuilder::new(session.clone())
-            .build_for_plan(&plan)
-            .await
-            .unwrap();
-        let table = |name: &str| catalog.table_by_ref(&TableRef::bare(name)).unwrap();
-        let db1 = Some(SourceId("stub/db1".into()));
-
-        assert_eq!(table("local_t").location, None);
-        assert_eq!(table("local_t").statistics.unwrap().row_count, Some(3));
-        assert_eq!(table("remote_t").location, db1);
-        assert!(table("remote_t").statistics.is_none());
-        assert_eq!(table("mirrored_t").location, db1);
-        assert_eq!(table("mirrored_t").statistics.unwrap().row_count, Some(3));
     }
 }

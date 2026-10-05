@@ -66,3 +66,13 @@ transferred), and plans it with `federation::federated_exec`, which yields the
 take the same direct physical path as local ones and need no `FederatedQueryPlanner`; that planner is
 only needed for the logical path. The projection refers to columns by qualifier and name, like the
 rest of `to_df_logical`.
+
+## End-to-End Tests
+
+`optd/connectors/datafusion/tests/federation.rs` runs queries through `OptdRunner` against remote
+sources that are separate DataFusion sessions behind a recording SQL executor. Each test compares
+results with plain DataFusion and checks exactly which tables each source's SQL scanned. A remote
+scan that optd failed to push would be read through its local fallback copy and be missing from the
+recorded SQL; one remote table has no fallback, so it cannot be read locally at all. The physical
+path tests run without `FederatedQueryPlanner`, so falling back to the logical path would fail; one
+test runs the logical path explicitly.

@@ -2900,6 +2900,7 @@ dependencies = [
  "datafusion-physical-expr",
  "datafusion-sqllogictest",
  "duckdb",
+ "futures",
  "optd-core",
  "rustyline",
  "sqllogictest",
