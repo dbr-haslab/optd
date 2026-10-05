@@ -209,7 +209,11 @@ impl CostModel for FederationCostModel {
         let Some(source) = operator_source(data, &input_sources, catalog.as_ref()) else {
             return Ok(FederatedCost {
                 remote: None,
-                delivered: local + inputs_delivered,
+                // Same summation order as `DefaultCostModel`, so all-local plans cost the same
+                // to the bit and keep their join order.
+                delivered: child_costs
+                    .iter()
+                    .fold(local, |total, cost| total + cost.delivered),
             });
         };
 
@@ -501,5 +505,29 @@ mod tests {
 
         assert!(shape(&opt.query, root).contains("Remote[pg/db1](Join("));
         assert_eq!(ordered, placed);
+    }
+
+    #[test]
+    fn local_plans_cost_the_same_as_the_default_model() {
+        let opt = skewed_federated_query();
+        // The same tables and statistics, but local.
+        let (catalog, _) = catalog_with(&[("a", None), ("b", None), ("c", None)]);
+        for (name, rows) in [("a", 10_000), ("b", 10), ("c", 1_000)] {
+            catalog
+                .set_table_statistics(TableRef::bare(name), stats(rows))
+                .unwrap();
+        }
+        let mut analyses = AnalysisContext::new(catalog);
+        let root = opt.query.root().unwrap();
+
+        let federated = FederationCostModel::default()
+            .total_cost(root, &opt.query, &mut analyses)
+            .unwrap();
+        let default = DefaultCostModel
+            .total_cost(root, &opt.query, &mut analyses)
+            .unwrap();
+
+        assert_eq!(federated.remote, None);
+        assert_eq!(federated.delivered.to_bits(), default.to_bits());
     }
 }

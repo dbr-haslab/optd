@@ -26,7 +26,7 @@ use optd_core::{
     optimizer_visualizer_trace_json,
 };
 
-use crate::runner::{default_pass_manager, optimizer_context_from_logical_plan};
+use crate::runner::{optd_config, optimizer_context_from_logical_plan, pass_manager};
 use crate::runtime_statistics::RuntimeStatisticsCatalogBuilder;
 
 /// Registers `explain_box`, `explain_json`, `explain_flat`, `explain_optimizer_json`, and
@@ -290,7 +290,7 @@ async fn build_ir(
     let plan = state.create_logical_plan(sql).await?;
     let plan = explain_input_plan(&plan);
     let mut opt = optimizer_context_for_explain(state, plan).await?;
-    let mut pm = default_pass_manager();
+    let mut pm = pass_manager(&optd_config(state.config()));
     pm.run(&mut opt)
         .map_err(|e| DataFusionError::Plan(e.to_string()))?;
     if let Some(root) = opt.query.root() {
@@ -321,7 +321,7 @@ async fn build_ir_trace(
         plan: format_query(&opt.query, &catalog, format, config.clone()),
     }];
 
-    let mut pm = default_pass_manager();
+    let mut pm = pass_manager(&optd_config(state.config()));
     let trace = pm
         .run_with_trace(&mut opt)
         .map_err(|e| DataFusionError::Plan(e.to_string()))?;
@@ -351,7 +351,7 @@ async fn build_optimizer_visualizer_trace(
     let mut opt = optimizer_context_for_explain(state, plan).await?;
     let initial = opt.query.clone();
     let catalog = Arc::clone(opt.analyses.catalog());
-    let mut pm = default_pass_manager();
+    let mut pm = pass_manager(&optd_config(state.config()));
     let trace = pm
         .run_with_trace(&mut opt)
         .map_err(|e| DataFusionError::Plan(e.to_string()))?;

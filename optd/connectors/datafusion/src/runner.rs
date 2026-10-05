@@ -16,9 +16,10 @@ use datafusion_sqllogictest::{
     DFColumnType, DFSqlLogicTestError, convert_batches, convert_schema_to_types,
 };
 use optd_core::{
-    ExprSimplify, HolisticUnnesting, JoinOrdering, JoinTreeNormalize, MarkJoinToSemiJoin,
-    OperatorRewriteAdaptor, OptimizerContext, PassManager, PlannedQuery, PredicatePushdown,
-    ProjectionElimination, QueryContext, QueryFormatConfig, RemotePlacement, SubqueryToJoin,
+    ExprSimplify, FederationCostModel, HolisticUnnesting, JoinOrdering, JoinTreeNormalize,
+    MarkJoinToSemiJoin, OperatorRewriteAdaptor, OptimizerContext, PassManager, PlannedQuery,
+    PredicatePushdown, ProjectionElimination, QueryContext, QueryFormatConfig, RemotePlacement,
+    SubqueryToJoin,
 };
 use sqllogictest::{AsyncDB, DBOutput};
 
@@ -31,8 +32,11 @@ use crate::runtime_statistics::RuntimeStatisticsCatalogBuilder;
 use crate::to_df_logical::to_logical_plan;
 use crate::to_df_physical::{ToPhysicalError, to_physical_plan};
 
-fn optimize(mut opt: OptimizerContext) -> Result<PlannedQuery, optd_core::OptimizeError> {
-    let mut pm = default_pass_manager();
+fn optimize(
+    mut opt: OptimizerContext,
+    config: &OptdExtensionConfig,
+) -> Result<PlannedQuery, optd_core::OptimizeError> {
+    let mut pm = pass_manager(config);
     pm.run(&mut opt)?;
     if let Some(root) = opt.query.root() {
         let resolved = opt.rewrites.resolve(root);
@@ -69,7 +73,23 @@ pub(crate) async fn optimizer_context_from_logical_plan(
 }
 
 /// Returns the canonical optimizer pass pipeline used across all execution paths.
+/// Returns the optd settings of `config`, or the defaults when none are registered.
+pub(crate) fn optd_config(config: &datafusion::prelude::SessionConfig) -> OptdExtensionConfig {
+    config
+        .options()
+        .extensions
+        .get::<OptdExtensionConfig>()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Returns the optimizer pipeline with the default settings.
 pub fn default_pass_manager() -> PassManager {
+    pass_manager(&OptdExtensionConfig::default())
+}
+
+/// Returns the optimizer pipeline configured by `config`.
+pub fn pass_manager(config: &OptdExtensionConfig) -> PassManager {
     let mut pm = PassManager::new();
     pm.add_pass(SubqueryToJoin);
     pm.add_pass(OperatorRewriteAdaptor::new(ExprSimplify));
@@ -78,7 +98,11 @@ pub fn default_pass_manager() -> PassManager {
     pm.add_pass(OperatorRewriteAdaptor::new(PredicatePushdown));
     pm.add_pass(JoinTreeNormalize::new());
     pm.add_pass(OperatorRewriteAdaptor::new(ProjectionElimination));
-    pm.add_pass(JoinOrdering::new());
+    // Costs equal the default model's when no table is remote, so local plans are unaffected.
+    pm.add_pass(JoinOrdering::with_cost_model(FederationCostModel {
+        transfer_cost_per_row: config.transfer_cost_per_row,
+        remote_cost_factor: config.remote_cost_factor,
+    }));
     pm.add_pass(RemotePlacement);
     pm
 }
@@ -349,7 +373,8 @@ impl OptdRunner {
     ) -> Result<PlannedQuery, TryViaIrError> {
         let opt =
             optimizer_context_from_logical_plan(&self.session, &self.runtime_stats, plan).await?;
-        optimize(opt).map_err(|e| TryViaIrError::Failed(e.to_string()))
+        optimize(opt, &optd_config(self.session.state().config()))
+            .map_err(|e| TryViaIrError::Failed(e.to_string()))
     }
 
     async fn execute_optimized_ir(
@@ -497,6 +522,7 @@ mod tests {
             optd_enabled: true,
             log_explain_steps: true,
             physical_planning: true,
+            ..Default::default()
         }))
     }
 
@@ -506,6 +532,7 @@ mod tests {
             optd_enabled: true,
             log_explain_steps: false,
             physical_planning: false,
+            ..Default::default()
         });
         let runner = OptdRunner::new(session);
         assert!(!runner.log_explain_steps_enabled());
@@ -523,6 +550,7 @@ mod tests {
             optd_enabled: false,
             log_explain_steps: true,
             physical_planning: false,
+            ..Default::default()
         });
         let runner = OptdRunner::new(session);
         assert!(!runner.optd_enabled());
@@ -632,6 +660,7 @@ mod tests {
             optd_enabled: true,
             log_explain_steps: true,
             physical_planning: false,
+            ..Default::default()
         }));
         let (_, batches, path) = runner
             .try_via_ir_with_path(
@@ -712,6 +741,7 @@ mod tests {
             optd_enabled: true,
             log_explain_steps: false,
             physical_planning: true,
+            ..Default::default()
         });
         session.register_table("t", Arc::new(table)).unwrap();
         let runner = OptdRunner::new(session);

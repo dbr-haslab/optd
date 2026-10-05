@@ -53,6 +53,16 @@ charges hash joins `(left_rows * right_rows)^0.75`, wherever they run, so pushin
 when the rows it saves transferring outweigh its remote cost. Both parameters default to `1.0` and
 are not calibrated; transfer is charged per row, not per byte.
 
+The DataFusion pipeline always orders joins with this model, configured by the session settings
+`optd.transfer_cost_per_row` and `optd.remote_cost_factor` (both `1.0` by default). With no remote
+tables its costs equal `DefaultCostModel`'s to the bit, including summation order, so local queries
+keep their plans.
+
+The two settings describe the deployment, not optd's local operators, whose costs stay fixed in
+`DefaultCostModel`. They are therefore relative to that model's units: a transfer cost of `100`
+means moving a row costs as much as the default model charges for about 100 units of local work.
+Until real sources are calibrated, treat them as an experiment dial rather than a measured value.
+
 ## DataFusion Connector
 
 The connector depends on `datafusion-federation` 0.5.3, which requires DataFusion 53; upgrade both
@@ -169,9 +179,24 @@ tables and only the columns the query needs; the filter on `orders` runs at `db1
 -- simulated/db1: SELECT orders.o_orderkey, orders.o_custkey FROM orders WHERE (orders.o_orderdate < CAST('1995-03-15' AS DATE))
 ```
 
-With the default cost model, join ordering does not account for where tables live, so `orders` and
-`lineitem` are fetched separately and joined locally even though both are at `db1`. Choosing join
-order and pushdown together is the next phase of the plan.
+At the default transfer cost of `1.0` per row, `orders` and `lineitem` are fetched separately and
+joined locally even though both are at `db1`: the default model's join costs dwarf the transfer this
+join would save. Making transfer more expensive moves the join to `db1`, which then returns only the
+two columns the rest of the query needs:
+
+```sh
+./target/release/optd-cli --tpch --remote db1=orders,lineitem --remote db2=customer \
+  -c "SET optd.log_explain_steps = false" \
+  -c "SET optd.transfer_cost_per_row = 100" \
+  -c "SELECT c_mktsegment, sum(l_extendedprice) AS revenue
+      FROM customer JOIN orders ON c_custkey = o_custkey JOIN lineitem ON l_orderkey = o_orderkey
+      WHERE o_orderdate < DATE '1995-03-15' GROUP BY c_mktsegment ORDER BY c_mktsegment"
+```
+
+```text
+-- simulated/db1: SELECT lineitem.l_extendedprice, orders.o_custkey FROM lineitem INNER JOIN orders ON ((lineitem.l_orderkey = orders.o_orderkey) AND (orders.o_orderdate < CAST('1995-03-15' AS DATE)))
+-- simulated/db2: SELECT customer.c_mktsegment, customer.c_custkey FROM customer
+```
 
 ### Inspecting the plan without executing
 
