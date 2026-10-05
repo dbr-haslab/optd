@@ -111,6 +111,10 @@ recorded SQL; one remote table has no fallback, so it cannot be read locally at 
 path tests run without `FederatedQueryPlanner`, so falling back to the logical path would fail; one
 test runs the logical path explicitly.
 
+Two tests check join-order selection on skewed tables, with statistics collected from the loaded
+data: the same query joins the two `db1` tables at the source when `optd.transfer_cost_per_row` is
+high and fetches them separately when it is low.
+
 ## Simulated Sources
 
 `federation::SimulatedSource` is a remote database simulated by a separate DataFusion session.

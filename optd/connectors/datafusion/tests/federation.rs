@@ -25,39 +25,59 @@ struct Federation {
     db2: Arc<SimulatedSource>,
 }
 
-/// Creates `name(id, value_column)` with `rows` in `session`.
-async fn create_table(session: &SessionContext, name: &str, value_column: &str, rows: &str) {
-    session
-        .sql(&format!(
-            "CREATE TABLE {name} AS SELECT * FROM (VALUES {rows}) AS t(id, {value_column})"
-        ))
-        .await
-        .unwrap();
+/// Small tables: every placement is visible in a few rows.
+const SMALL: [(&str, &str); 4] = [
+    (
+        "a",
+        "SELECT * FROM (VALUES (1, 10), (2, 20), (3, 30)) AS t(id, x)",
+    ),
+    (
+        "c",
+        "SELECT * FROM (VALUES (1, 100), (3, 300), (4, 400)) AS t(id, y)",
+    ),
+    ("d", "SELECT * FROM (VALUES (1, 7), (3, 9)) AS t(id, w)"),
+    (
+        "b",
+        "SELECT * FROM (VALUES (1, 5), (2, 6), (3, 8)) AS t(id, z)",
+    ),
+];
+
+/// Skewed sizes, as in the core federation cost model tests: `a` has 10,000 rows and `c` 1,000,
+/// both at `db1`, and local `b` has 10. Joining `b` first is the locally cheapest order, while
+/// joining `a` and `c` at `db1` transfers fewer rows.
+const SKEWED: [(&str, &str); 4] = [
+    ("a", "SELECT value AS id, value AS x FROM range(1, 10001)"),
+    ("c", "SELECT value AS id, value AS y FROM range(1, 1001)"),
+    ("d", "SELECT * FROM (VALUES (1, 7)) AS t(id, w)"),
+    ("b", "SELECT value AS id, value AS z FROM range(1, 11)"),
+];
+
+/// Builds the federation over the small tables; `physical_planning` selects optd's execution path.
+async fn federation(physical_planning: bool) -> Federation {
+    let mut config = OptdExtensionConfig::default();
+    config.physical_planning = physical_planning;
+    federation_with(config, &SMALL).await
 }
 
-/// Builds the federation; `physical_planning` selects optd's execution path.
-async fn federation(physical_planning: bool) -> Federation {
-    let mut optd_config = OptdExtensionConfig::default();
-    optd_config.physical_planning = physical_planning;
+/// Builds the federation over `tables`, given as `(name, query)`, with optd settings `config`.
+async fn federation_with(config: OptdExtensionConfig, tables: &[(&str, &str)]) -> Federation {
     // Only the logical path plans `FederatedPlanNode`s through the query planner, so the physical
     // path runs without it and would fail if it fell back to the logical path.
+    let physical_planning = config.physical_planning;
     let mut state = SessionStateBuilder::new()
-        .with_config(SessionConfig::new().with_option_extension(optd_config))
+        .with_config(SessionConfig::new().with_option_extension(config))
         .with_default_features();
     if !physical_planning {
         state = state.with_query_planner(Arc::new(FederatedQueryPlanner::new()));
     }
     let optd = SessionContext::new_with_state(state.build());
     let baseline = SessionContext::new();
-    for (name, value_column, rows) in [
-        ("a", "x", "(1, 10), (2, 20), (3, 30)"),
-        ("c", "y", "(1, 100), (3, 300), (4, 400)"),
-        ("d", "w", "(1, 7), (3, 9)"),
-        ("b", "z", "(1, 5), (2, 6), (3, 8)"),
-    ] {
-        create_table(&optd, name, value_column, rows).await;
+    for (name, query) in tables {
+        optd.sql(&format!("CREATE TABLE {name} AS {query}"))
+            .await
+            .unwrap();
         baseline
-            .register_table(name, optd.table_provider(name).await.unwrap())
+            .register_table(*name, optd.table_provider(*name).await.unwrap())
             .unwrap();
     }
 
@@ -197,4 +217,39 @@ async fn logical_path_runs_regions_remotely() {
         .await;
 
     federation.assert_scanned(&["a", "c"], &[]);
+}
+
+/// Runs `(a ⋈ b) ⋈ c` over the skewed tables with the given transfer cost and returns `db1`'s SQL.
+async fn skewed_join_at_transfer_cost(transfer_cost_per_row: f64) -> Vec<String> {
+    let mut config = OptdExtensionConfig::default();
+    config.transfer_cost_per_row = transfer_cost_per_row;
+    let federation = federation_with(config, &SKEWED).await;
+
+    federation
+        .assert_matches_baseline(
+            "SELECT a.id, a.x, b.z, c.y FROM a JOIN b ON a.id = b.id JOIN c ON a.id = c.id",
+        )
+        .await;
+
+    federation.assert_scanned(&["a", "c"], &[]);
+    federation.db1.queries()
+}
+
+#[tokio::test]
+async fn expensive_transfer_joins_same_source_tables_at_the_source() {
+    let queries = skewed_join_at_transfer_cost(100.0).await;
+
+    assert_eq!(queries.len(), 1, "{queries:?}");
+    assert!(queries[0].contains("JOIN"), "{queries:?}");
+}
+
+#[tokio::test]
+async fn cheap_transfer_fetches_same_source_tables_separately() {
+    let queries = skewed_join_at_transfer_cost(0.001).await;
+
+    assert_eq!(queries.len(), 2, "{queries:?}");
+    assert!(
+        queries.iter().all(|sql| !sql.contains("JOIN")),
+        "{queries:?}"
+    );
 }
