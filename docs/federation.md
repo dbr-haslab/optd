@@ -19,8 +19,7 @@ Location is metadata, separate from statistics. A remote table's statistics use 
 `OperatorData::Remote { source, input }` marks a subtree that runs entirely at `source`. Rows move
 from the source to the local engine at this node. It is relationally transparent: analyses return
 its input's values, and it creates no columns. The default cost model charges one unit per row as a
-placeholder for transfer cost. Substrait export and both DataFusion converters reject it until
-remote lowering is implemented.
+placeholder for transfer cost. Substrait export rejects it.
 
 ## Remote Placement
 
@@ -49,3 +48,16 @@ without a local fallback provider cannot be scanned), the table is registered wi
 and cardinality estimation uses its fallback defaults. An adaptor created with
 `FederatedTableProviderAdaptor::new_with_provider` is scanned through its fallback provider, which
 is how tests give remote tables real statistics.
+
+## Lowering
+
+`to_df_logical` converts a `Remote` marker's subtree as usual and wraps it with
+`federation::federate` in a `datafusion-federation` `FederatedPlanNode`, planned by a
+`SQLFederationPlanner` over the source's executor. The executor comes from the region's own table
+scans, and every scan must be a federated SQL table at the marker's source; otherwise lowering
+fails. Executing the plan requires a session whose query planner is `FederatedQueryPlanner`; the
+region's SQL is generated only at execution, so unsupported shapes fail then. `FederationOptimizerRule`
+is not used.
+
+`to_df_physical` still rejects `Remote` as unsupported, so the runner uses the logical path for
+queries with remote regions.

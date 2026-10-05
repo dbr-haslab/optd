@@ -1,8 +1,14 @@
 //! Connector-side federation support built on `datafusion-federation`.
 
+use std::sync::Arc;
+
 use datafusion::catalog::TableProvider;
-use datafusion_federation::FederatedTableProviderAdaptor;
-use datafusion_federation::sql::SQLTableSource;
+use datafusion::common::plan_err;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::error::Result;
+use datafusion::logical_expr::{Extension, LogicalPlan};
+use datafusion_federation::sql::{SQLExecutor, SQLFederationPlanner, SQLTableSource};
+use datafusion_federation::{FederatedPlanNode, FederatedTableProviderAdaptor, get_table_source};
 use optd_core::SourceId;
 
 /// Returns the remote source holding a table, or `None` for a local table.
@@ -15,7 +21,230 @@ pub fn table_location(provider: &dyn TableProvider) -> Option<SourceId> {
         .as_any()
         .downcast_ref::<FederatedTableProviderAdaptor>()?;
     let source = adaptor.source.as_any().downcast_ref::<SQLTableSource>()?;
-    let executor = &source.provider.executor;
+    executor_source(source.provider.executor.as_ref())
+}
+
+fn executor_source(executor: &dyn SQLExecutor) -> Option<SourceId> {
     let context = executor.compute_context()?;
     Some(SourceId(format!("{}/{context}", executor.name()).into()))
+}
+
+/// Wraps `region` in a `FederatedPlanNode` that runs it at `source` through its SQL executor.
+///
+/// Every table scanned in `region` must be a federated SQL table at `source`.
+pub fn federate(region: LogicalPlan, source: &SourceId) -> Result<LogicalPlan> {
+    let mut executor = None;
+    region.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node {
+            let scan_executor = get_table_source(&scan.source)?.and_then(|table| {
+                let sql = table.as_any().downcast_ref::<SQLTableSource>()?;
+                Some(sql.provider.executor.clone())
+            });
+            match scan_executor {
+                Some(scan_executor)
+                    if executor_source(scan_executor.as_ref()).as_ref() == Some(source) =>
+                {
+                    executor = Some(scan_executor);
+                }
+                _ => {
+                    return plan_err!(
+                        "table {} is not at remote source {}",
+                        scan.table_name,
+                        source.0
+                    );
+                }
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    let Some(executor) = executor else {
+        return plan_err!("remote region at {} scans no tables", source.0);
+    };
+    let planner = Arc::new(SQLFederationPlanner::new(executor));
+    Ok(LogicalPlan::Extension(Extension {
+        node: Arc::new(FederatedPlanNode::new(region, planner)),
+    }))
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Arc;
+
+    use datafusion::arrow::datatypes::SchemaRef;
+    use datafusion::catalog::TableProvider;
+    use datafusion::common::{TableReference, not_impl_err};
+    use datafusion::error::Result;
+    use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::physical_plan::PhysicalExpr;
+    use datafusion::sql::unparser::dialect::{DefaultDialect, Dialect};
+    use datafusion_federation::FederatedTableProviderAdaptor;
+    use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
+
+    /// A SQL executor at source `stub/db1` that never executes anything.
+    pub(crate) struct StubExecutor;
+
+    #[async_trait::async_trait]
+    impl SQLExecutor for StubExecutor {
+        fn name(&self) -> &str {
+            "stub"
+        }
+
+        fn compute_context(&self) -> Option<String> {
+            Some("db1".to_string())
+        }
+
+        fn dialect(&self) -> Arc<dyn Dialect> {
+            Arc::new(DefaultDialect {})
+        }
+
+        fn execute(
+            &self,
+            _query: &str,
+            _schema: SchemaRef,
+            _filters: &[Arc<dyn PhysicalExpr>],
+        ) -> Result<SendableRecordBatchStream> {
+            not_impl_err!("stub executor")
+        }
+
+        async fn table_names(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_table_schema(&self, _table_name: &str) -> Result<SchemaRef> {
+            not_impl_err!("stub executor")
+        }
+    }
+
+    /// Returns a table at source `stub/db1`, optionally scannable through a local `fallback`.
+    pub(crate) fn remote_table(
+        name: &str,
+        schema: SchemaRef,
+        fallback: Option<Arc<dyn TableProvider>>,
+    ) -> Arc<FederatedTableProviderAdaptor> {
+        let provider = Arc::new(SQLFederationProvider::new(Arc::new(StubExecutor)));
+        let source = Arc::new(SQLTableSource::new_with_schema(
+            provider,
+            TableReference::bare(name).into(),
+            schema,
+        ));
+        Arc::new(match fallback {
+            Some(fallback) => FederatedTableProviderAdaptor::new_with_provider(source, fallback),
+            None => FederatedTableProviderAdaptor::new(source),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::remote_table;
+    use super::*;
+    use crate::to_df_logical::to_logical_plan;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+    use optd_core::{
+        Catalog, ExprData, Join, JoinType, MemoryCatalog, OperatorData, Output, PlannedQuery,
+        QueryContext, Remote, ScalarValue, TableRef,
+    };
+
+    /// Names of tables scanned by `plan`, not looking inside federated regions.
+    fn scanned_tables(plan: &LogicalPlan) -> Vec<String> {
+        let mut tables = Vec::new();
+        plan.apply(|node| {
+            if let LogicalPlan::TableScan(scan) = node {
+                tables.push(scan.table_name.to_string());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        tables.sort();
+        tables
+    }
+
+    fn federated_regions(plan: &LogicalPlan) -> Vec<LogicalPlan> {
+        let mut regions = Vec::new();
+        plan.apply(|node| {
+            if let LogicalPlan::Extension(extension) = node
+                && let Some(federated) = extension.node.as_any().downcast_ref::<FederatedPlanNode>()
+            {
+                regions.push(federated.plan().clone());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        regions
+    }
+
+    #[tokio::test]
+    async fn lowers_remote_marker_to_federated_node() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let session = SessionContext::new();
+        let catalog = Arc::new(MemoryCatalog::new("datafusion", "public"));
+        for name in ["a", "b", "c"] {
+            let provider: Arc<dyn TableProvider> = if name == "b" {
+                Arc::new(MemTable::try_new(schema.clone(), vec![vec![]]).unwrap())
+            } else {
+                remote_table(name, schema.clone(), None)
+            };
+            session.register_table(name, provider).unwrap();
+            catalog
+                .create_table(TableRef::bare(name), schema.clone(), None)
+                .unwrap();
+        }
+
+        let mut query = QueryContext::new();
+        let mut scan = |table| {
+            query
+                .add_scan_from_catalog(catalog.as_ref(), TableRef::bare(table))
+                .unwrap()
+        };
+        let (a, b, c) = (scan("a"), scan("b"), scan("c"));
+        let on = ExprData::Literal(ScalarValue::Boolean(true)).add(&mut query);
+        let join = |outer, inner, query: &mut QueryContext| {
+            OperatorData::Join(Join {
+                join_type: JoinType::Inner,
+                on,
+                outer,
+                inner,
+            })
+            .add(query)
+        };
+        let ac = join(a, c, &mut query);
+        let remote = OperatorData::Remote(Remote {
+            source: SourceId("stub/db1".into()),
+            input: ac,
+        })
+        .add(&mut query);
+        let root = join(remote, b, &mut query);
+        let output = OperatorData::Output(Output { input: root }).add(&mut query);
+        query.set_root(output);
+
+        let plan = to_logical_plan(&PlannedQuery::new(query, catalog), &session)
+            .await
+            .unwrap();
+
+        assert_eq!(scanned_tables(&plan), vec!["datafusion.public.b"]);
+        let regions = federated_regions(&plan);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(
+            scanned_tables(&regions[0]),
+            vec!["datafusion.public.a", "datafusion.public.c"]
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_region_with_table_at_another_source() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let session = SessionContext::new();
+        let local = MemTable::try_new(schema, vec![vec![]]).unwrap();
+        session.register_table("t", Arc::new(local)).unwrap();
+        let region = session.table("t").await.unwrap().into_unoptimized_plan();
+
+        let error = federate(region, &SourceId("stub/db1".into())).unwrap_err();
+
+        assert!(
+            error.to_string().contains("not at remote source"),
+            "{error}"
+        );
+    }
 }

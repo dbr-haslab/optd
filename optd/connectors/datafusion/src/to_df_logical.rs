@@ -26,6 +26,8 @@ use optd_core::{
     PlannedQuery, QueryContext, Relation, ScalarValue, TableRef, UnaryOp,
 };
 
+use crate::federation::federate;
+
 /// Error type for the optd → DataFusion converter.
 #[derive(Debug)]
 pub enum ToDFError {
@@ -564,7 +566,10 @@ fn convert_operator_inner(
 
         OperatorData::TableFunction(_) => Err(ToDFError::Unsupported("TableFunction".into())),
 
-        OperatorData::Remote(_) => Err(ToDFError::Unsupported("Remote".into())),
+        OperatorData::Remote(remote) => {
+            let region = convert_operator_inner(remote.input, ctx, outer_refs, column_qualifiers)?;
+            Ok(federate(region, &remote.source)?)
+        }
 
         OperatorData::ConstScan(const_scan) => {
             use datafusion::logical_expr::EmptyRelation;
