@@ -67,12 +67,108 @@ take the same direct physical path as local ones and need no `FederatedQueryPlan
 only needed for the logical path. The projection refers to columns by qualifier and name, like the
 rest of `to_df_logical`.
 
+Before SQL generation, both paths put a projection directly above every aggregate in the region
+that lacks one. DataFusion's SQL planner always produces that shape and its SQL unparser relies on it
+to rebuild `SELECT ... GROUP BY`; without it, the unparser nests the aggregation or emits columns out
+of schema order. Plans converted from optd may omit the projection.
+
 ## End-to-End Tests
 
-`optd/connectors/datafusion/tests/federation.rs` runs queries through `OptdRunner` against remote
-sources that are separate DataFusion sessions behind a recording SQL executor. Each test compares
+`optd/connectors/datafusion/tests/federation.rs` runs queries through `OptdRunner` against
+`federation::SimulatedSource`s, the same simulated remote databases the CLI uses. Each test compares
 results with plain DataFusion and checks exactly which tables each source's SQL scanned. A remote
 scan that optd failed to push would be read through its local fallback copy and be missing from the
 recorded SQL; one remote table has no fallback, so it cannot be read locally at all. The physical
 path tests run without `FederatedQueryPlanner`, so falling back to the logical path would fail; one
 test runs the logical path explicitly.
+
+## Simulated Sources
+
+`federation::SimulatedSource` is a remote database simulated by a separate DataFusion session.
+`SimulatedSource::adopt` moves a registered table into the source and re-registers it locally as a
+remote table at `simulated/{name}`. With a fallback, the local registration can still scan the
+original table, so optd collects statistics for it. The source executes the SQL optd sends, records
+it, and optionally prints it to stderr.
+
+## Command-Line Examples
+
+The CLI's `--remote SOURCE=TABLE[,TABLE...]` option moves already registered tables to a simulated
+source; pass it once per source. Each source prints the SQL it receives as
+`-- simulated/{source}: ...`. The examples use TPC-H data, downloaded with
+`./scripts/download_tpch_hf.sh`. The CLI logs optd's optimizer steps for each statement; a leading
+`-c "SET optd.log_explain_steps = false"` turns that off. The `SET` statement itself prints
+`DataFusion error: Error during planning: non-query plan` (step logging does not apply to it) and
+`OK`; the outputs below omit those two lines.
+
+Build the CLI once:
+
+```sh
+cargo build --release -p optd-datafusion --bin optd-cli
+```
+
+### A query whose tables share a source
+
+All tables are at `db1`, so the whole query, including the aggregation and sort, runs there as one
+SQL statement:
+
+```sh
+./target/release/optd-cli --tpch --remote db1=orders,customer \
+  -c "SET optd.log_explain_steps = false" \
+  -c "SELECT c_mktsegment, count(*) AS orders FROM orders JOIN customer ON o_custkey = c_custkey
+      WHERE o_orderstatus = 'F' GROUP BY c_mktsegment ORDER BY c_mktsegment"
+```
+
+```text
+-- simulated/db1: SELECT customer.c_mktsegment, count(1) AS "count(Int64(1))" FROM orders INNER JOIN customer ON ((orders.o_custkey = customer.c_custkey) AND (orders.o_orderstatus = CAST('F' AS VARCHAR))) GROUP BY customer.c_mktsegment ORDER BY customer.c_mktsegment ASC NULLS LAST
++--------------+-----------------+
+| c_mktsegment | count(Int64(1)) |
++--------------+-----------------+
+| AUTOMOBILE   | 14571           |
+| BUILDING     | 15264           |
+| FURNITURE    | 14083           |
+| HOUSEHOLD    | 14457           |
+| MACHINERY    | 14509           |
++--------------+-----------------+
+```
+
+### A query across sources
+
+`orders` and `lineitem` are at `db1`, and `customer` is at `db2`. Each source receives only its own
+tables and only the columns the query needs; the filter on `orders` runs at `db1`:
+
+```sh
+./target/release/optd-cli --tpch --remote db1=orders,lineitem --remote db2=customer \
+  -c "SET optd.log_explain_steps = false" \
+  -c "SELECT c_mktsegment, sum(l_extendedprice) AS revenue
+      FROM customer JOIN orders ON c_custkey = o_custkey JOIN lineitem ON l_orderkey = o_orderkey
+      WHERE o_orderdate < DATE '1995-03-15' GROUP BY c_mktsegment ORDER BY c_mktsegment"
+```
+
+```text
+-- simulated/db1: SELECT lineitem.l_extendedprice, lineitem.l_orderkey FROM lineitem
+-- simulated/db2: SELECT customer.c_mktsegment, customer.c_custkey FROM customer
+-- simulated/db1: SELECT orders.o_orderkey, orders.o_custkey FROM orders WHERE (orders.o_orderdate < CAST('1995-03-15' AS DATE))
+```
+
+With the default cost model, join ordering does not account for where tables live, so `orders` and
+`lineitem` are fetched separately and joined locally even though both are at `db1`. Choosing join
+order and pushdown together is the next phase of the plan.
+
+### Inspecting the plan without executing
+
+`--direct-physical-plan` prints the physical plan instead of running the query. Each remote region
+appears as a `VirtualExecutionPlan` with the SQL it would send:
+
+```sh
+./target/release/optd-cli --tpch --remote db1=orders,customer --direct-physical-plan \
+  -c "SELECT c_mktsegment, count(*) FROM orders JOIN customer ON o_custkey = c_custkey
+      GROUP BY c_mktsegment"
+```
+
+```text
+SchemaCastScanExec
+  VirtualExecutionPlan name=simulated compute_context=db1 base_sql=SELECT customer.c_mktsegment, count(1) AS "count(Int64(1))" FROM orders INNER JOIN customer ON (orders.o_custkey = customer.c_custkey) GROUP BY customer.c_mktsegment
+```
+
+`--logical` runs the same queries on the logical conversion path; the CLI's session includes
+`FederatedQueryPlanner` for it.

@@ -6,85 +6,23 @@
 //! remote scan that optd failed to push would be read through its local fallback copy and be
 //! missing from the recorded SQL, and table `d` has no fallback at all.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
-use datafusion::common::TableReference;
-use datafusion::error::Result;
-use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::physical_plan::PhysicalExpr;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion::sql::unparser::dialect::{DefaultDialect, Dialect};
-use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
-use datafusion_federation::{FederatedQueryPlanner, FederatedTableProviderAdaptor};
-use futures::{StreamExt, TryStreamExt};
+use datafusion_federation::FederatedQueryPlanner;
 use optd_datafusion::config::OptdExtensionConfig;
+use optd_datafusion::federation::SimulatedSource;
 use optd_datafusion::runner::{OptdRunner, RunnerOutput};
-
-/// A remote source: a DataFusion session that records every SQL query it executes.
-struct RecordingExecutor {
-    context: &'static str,
-    remote: SessionContext,
-    queries: Mutex<Vec<String>>,
-}
-
-#[async_trait::async_trait]
-impl SQLExecutor for RecordingExecutor {
-    fn name(&self) -> &str {
-        "test"
-    }
-
-    fn compute_context(&self) -> Option<String> {
-        Some(self.context.to_string())
-    }
-
-    fn dialect(&self) -> Arc<dyn Dialect> {
-        Arc::new(DefaultDialect {})
-    }
-
-    fn execute(
-        &self,
-        query: &str,
-        schema: SchemaRef,
-        _filters: &[Arc<dyn PhysicalExpr>],
-    ) -> Result<SendableRecordBatchStream> {
-        self.queries.lock().unwrap().push(query.to_string());
-        let remote = self.remote.clone();
-        let query = query.to_string();
-        let batches =
-            futures::stream::once(async move { remote.sql(&query).await?.execute_stream().await })
-                .try_flatten();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            batches.boxed(),
-        )))
-    }
-
-    async fn table_names(&self) -> Result<Vec<String>> {
-        Ok(Vec::new())
-    }
-
-    async fn get_table_schema(&self, table_name: &str) -> Result<SchemaRef> {
-        Ok(self
-            .remote
-            .table(table_name)
-            .await?
-            .schema()
-            .inner()
-            .clone())
-    }
-}
 
 /// Tables `a` and `c` live at source `db1`, `d` at `db2`, and `b` is local.
 struct Federation {
     optd: OptdRunner,
     baseline: SessionContext,
-    db1: Arc<RecordingExecutor>,
-    db2: Arc<RecordingExecutor>,
+    db1: Arc<SimulatedSource>,
+    db2: Arc<SimulatedSource>,
 }
 
 /// Creates `name(id, value_column)` with `rows` in `session`.
@@ -99,14 +37,6 @@ async fn create_table(session: &SessionContext, name: &str, value_column: &str, 
 
 /// Builds the federation; `physical_planning` selects optd's execution path.
 async fn federation(physical_planning: bool) -> Federation {
-    let db1 = SessionContext::new();
-    create_table(&db1, "a", "x", "(1, 10), (2, 20), (3, 30)").await;
-    create_table(&db1, "c", "y", "(1, 100), (3, 300), (4, 400)").await;
-    let db2 = SessionContext::new();
-    create_table(&db2, "d", "w", "(1, 7), (3, 9)").await;
-    let baseline = SessionContext::new();
-    create_table(&baseline, "b", "z", "(1, 5), (2, 6), (3, 8)").await;
-
     let mut optd_config = OptdExtensionConfig::default();
     optd_config.physical_planning = physical_planning;
     // Only the logical path plans `FederatedPlanNode`s through the query planner, so the physical
@@ -118,46 +48,32 @@ async fn federation(physical_planning: bool) -> Federation {
         state = state.with_query_planner(Arc::new(FederatedQueryPlanner::new()));
     }
     let optd = SessionContext::new_with_state(state.build());
-    optd.register_table("b", baseline.table_provider("b").await.unwrap())
-        .unwrap();
-
-    let executor = |context, remote| {
-        Arc::new(RecordingExecutor {
-            context,
-            remote,
-            queries: Mutex::new(Vec::new()),
-        })
-    };
-    let federation = Federation {
-        optd: OptdRunner::new(optd.clone()),
-        baseline,
-        db1: executor("db1", db1),
-        db2: executor("db2", db2),
-    };
-    for (name, executor, fallback) in [
-        ("a", &federation.db1, true),
-        ("c", &federation.db1, true),
-        ("d", &federation.db2, false),
+    let baseline = SessionContext::new();
+    for (name, value_column, rows) in [
+        ("a", "x", "(1, 10), (2, 20), (3, 30)"),
+        ("c", "y", "(1, 100), (3, 300), (4, 400)"),
+        ("d", "w", "(1, 7), (3, 9)"),
+        ("b", "z", "(1, 5), (2, 6), (3, 8)"),
     ] {
-        let rows = executor.remote.table_provider(name).await.unwrap();
-        federation
-            .baseline
-            .register_table(name, rows.clone())
+        create_table(&optd, name, value_column, rows).await;
+        baseline
+            .register_table(name, optd.table_provider(name).await.unwrap())
             .unwrap();
-        let source = Arc::new(SQLTableSource::new_with_schema(
-            Arc::new(SQLFederationProvider::new(executor.clone())),
-            TableReference::bare(name).into(),
-            rows.schema(),
-        ));
-        // A fallback copy gives optd real statistics; without one the table gets defaults.
-        let adaptor = if fallback {
-            FederatedTableProviderAdaptor::new_with_provider(source, rows)
-        } else {
-            FederatedTableProviderAdaptor::new(source)
-        };
-        optd.register_table(name, Arc::new(adaptor)).unwrap();
     }
-    federation
+
+    let db1 = SimulatedSource::new("db1", false);
+    let db2 = SimulatedSource::new("db2", false);
+    db1.adopt(&optd, "a", true).await.unwrap();
+    db1.adopt(&optd, "c", true).await.unwrap();
+    // No fallback copy: `d` gets default statistics and cannot be read locally.
+    db2.adopt(&optd, "d", false).await.unwrap();
+
+    Federation {
+        optd: OptdRunner::new(optd),
+        baseline,
+        db1,
+        db2,
+    }
 }
 
 /// Formats rows as `v1|v2|...`, sorted, so results compare regardless of order and column names.
@@ -201,8 +117,8 @@ impl Federation {
 
     /// Asserts which tables each source's recorded SQL scanned.
     fn assert_scanned(&self, db1: &[&str], db2: &[&str]) {
-        for (executor, expected) in [(&self.db1, db1), (&self.db2, db2)] {
-            let queries = executor.queries.lock().unwrap();
+        for (source, expected) in [(&self.db1, db1), (&self.db2, db2)] {
+            let queries = source.queries();
             let scanned = ["a", "b", "c", "d"]
                 .into_iter()
                 .filter(|table| {
@@ -212,7 +128,7 @@ impl Federation {
                     })
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(scanned, expected, "{}: {queries:?}", executor.context);
+            assert_eq!(scanned, expected, "{queries:?}");
         }
     }
 }
@@ -226,7 +142,7 @@ async fn single_remote_scan_with_filter_runs_remotely() {
         .await;
 
     federation.assert_scanned(&["a"], &[]);
-    assert!(federation.db1.queries.lock().unwrap()[0].contains("> 15"));
+    assert!(federation.db1.queries()[0].contains("> 15"));
 }
 
 #[tokio::test]
@@ -238,7 +154,22 @@ async fn same_source_join_runs_remotely() {
         .await;
 
     federation.assert_scanned(&["a", "c"], &[]);
-    assert_eq!(federation.db1.queries.lock().unwrap().len(), 1);
+    assert_eq!(federation.db1.queries().len(), 1);
+}
+
+#[tokio::test]
+async fn same_source_aggregation_runs_remotely() {
+    let federation = federation(true).await;
+
+    federation
+        .assert_matches_baseline(
+            "SELECT a.x, count(*) AS matches FROM a JOIN c ON a.id = c.id \
+             GROUP BY a.x ORDER BY a.x",
+        )
+        .await;
+
+    federation.assert_scanned(&["a", "c"], &[]);
+    assert_eq!(federation.db1.queries().len(), 1);
 }
 
 #[tokio::test]

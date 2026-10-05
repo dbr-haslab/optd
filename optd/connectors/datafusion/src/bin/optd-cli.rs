@@ -5,14 +5,15 @@ use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion_federation::FederatedQueryPlanner;
 use optd_core::{CardinalityEstimationV1, FreeColumns, QueryFormatConfig};
 use optd_datafusion::config::OptdExtensionConfig;
 use optd_datafusion::explain_udfs::ExplainStep;
+use optd_datafusion::federation::SimulatedSource;
 use optd_datafusion::runner::{OptdRunner, RunnerOutput};
-use optd_datafusion::setup::{
-    register_job_tables, register_tpch_tables, session_context_with_information_schema,
-};
+use optd_datafusion::setup::{register_job_tables, register_tpch_tables};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
@@ -53,30 +54,46 @@ struct Args {
     /// Override DataFusion target partitions before registering benchmark tables.
     #[arg(long)]
     target_partitions: Option<usize>,
+
+    /// Move registered tables to a simulated remote source, as `SOURCE=TABLE[,TABLE...]`.
+    /// May be passed more than once. The SQL each source receives is printed to stderr.
+    #[arg(long = "remote", value_name = "SOURCE=TABLES")]
+    remotes: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
 
-    let session = if args.logical || args.target_partitions.is_some() {
-        let mut optd_config = OptdExtensionConfig::default();
-        optd_config.physical_planning = !args.logical;
-        let mut config = SessionConfig::new()
-            .with_information_schema(true)
-            .with_option_extension(optd_config);
-        if let Some(target_partitions) = args.target_partitions {
-            config = config.with_target_partitions(target_partitions);
-        }
-        SessionContext::new_with_config(config)
-    } else {
-        session_context_with_information_schema()
-    };
+    let mut optd_config = OptdExtensionConfig::default();
+    optd_config.physical_planning = !args.logical;
+    let mut config = SessionConfig::new()
+        .with_information_schema(true)
+        .with_option_extension(optd_config);
+    if let Some(target_partitions) = args.target_partitions {
+        config = config.with_target_partitions(target_partitions);
+    }
+    // The federated query planner lets the logical path execute remote regions.
+    let state = SessionStateBuilder::new()
+        .with_config(config)
+        .with_default_features()
+        .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+        .build();
+    let session = SessionContext::new_with_state(state);
     if args.tpch {
         register_tpch_tables(&session).await?;
     }
     if args.job {
         register_job_tables(&session).await?;
+    }
+    for remote in &args.remotes {
+        let (source, tables) = remote
+            .split_once('=')
+            .ok_or_else(|| format!("--remote expects SOURCE=TABLE[,TABLE...], got {remote:?}"))?;
+        let source = SimulatedSource::new(source, true);
+        for table in tables.split(',') {
+            source.adopt(&session, table, true).await?;
+        }
     }
     let runner = OptdRunner::new(session);
 
