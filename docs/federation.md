@@ -55,9 +55,14 @@ is how tests give remote tables real statistics.
 `federation::federate` in a `datafusion-federation` `FederatedPlanNode`, planned by a
 `SQLFederationPlanner` over the source's executor. The executor comes from the region's own table
 scans, and every scan must be a federated SQL table at the marker's source; otherwise lowering
-fails. Executing the plan requires a session whose query planner is `FederatedQueryPlanner`; the
-region's SQL is generated only at execution, so unsupported shapes fail then. `FederationOptimizerRule`
-is not used.
+fails. Executing a logical plan with such a node requires a session whose query planner is
+`FederatedQueryPlanner`. The region's SQL is generated only at execution, so unsupported shapes fail
+then. `FederationOptimizerRule` is not used.
 
-`to_df_physical` still rejects `Remote` as unsupported, so the runner uses the logical path for
-queries with remote regions.
+`to_df_physical`, optd's default execution path, lowers `Remote` the same way: it converts the
+subtree with `to_df_logical`, projects it to the columns the parent requires (so only those are
+transferred), and plans it with `federation::federated_exec`, which yields the
+`datafusion-federation` remote execution node (`VirtualExecutionPlan`). Federated queries therefore
+take the same direct physical path as local ones and need no `FederatedQueryPlanner`; that planner is
+only needed for the logical path. The projection refers to columns by qualifier and name, like the
+rest of `to_df_logical`.

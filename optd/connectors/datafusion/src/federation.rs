@@ -6,9 +6,13 @@ use datafusion::catalog::TableProvider;
 use datafusion::common::plan_err;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::error::Result;
+use datafusion::execution::SessionState;
 use datafusion::logical_expr::{Extension, LogicalPlan};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion_federation::sql::{SQLExecutor, SQLFederationPlanner, SQLTableSource};
-use datafusion_federation::{FederatedPlanNode, FederatedTableProviderAdaptor, get_table_source};
+use datafusion_federation::{
+    FederatedPlanNode, FederatedTableProviderAdaptor, FederationPlanner, get_table_source,
+};
 use optd_core::SourceId;
 
 /// Returns the remote source holding a table, or `None` for a local table.
@@ -33,6 +37,26 @@ fn executor_source(executor: &dyn SQLExecutor) -> Option<SourceId> {
 ///
 /// Every table scanned in `region` must be a federated SQL table at `source`.
 pub fn federate(region: LogicalPlan, source: &SourceId) -> Result<LogicalPlan> {
+    let planner = Arc::new(SQLFederationPlanner::new(region_executor(&region, source)?));
+    Ok(LogicalPlan::Extension(Extension {
+        node: Arc::new(FederatedPlanNode::new(region, planner)),
+    }))
+}
+
+/// Plans `region` as an execution node that runs it at `source`, like [`federate`] followed by
+/// `datafusion-federation`'s physical planning.
+pub async fn federated_exec(
+    region: LogicalPlan,
+    source: &SourceId,
+    state: &SessionState,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let planner = Arc::new(SQLFederationPlanner::new(region_executor(&region, source)?));
+    let node = FederatedPlanNode::new(region, planner.clone());
+    planner.plan_federation(&node, state).await
+}
+
+/// Returns the executor for `source`, checking that every table `region` scans is at `source`.
+fn region_executor(region: &LogicalPlan, source: &SourceId) -> Result<Arc<dyn SQLExecutor>> {
     let mut executor = None;
     region.apply(|node| {
         if let LogicalPlan::TableScan(scan) = node {
@@ -60,10 +84,7 @@ pub fn federate(region: LogicalPlan, source: &SourceId) -> Result<LogicalPlan> {
     let Some(executor) = executor else {
         return plan_err!("remote region at {} scans no tables", source.0);
     };
-    let planner = Arc::new(SQLFederationPlanner::new(executor));
-    Ok(LogicalPlan::Extension(Extension {
-        node: Arc::new(FederatedPlanNode::new(region, planner)),
-    }))
+    Ok(executor)
 }
 
 #[cfg(test)]
@@ -139,12 +160,14 @@ mod tests {
     use super::test_support::remote_table;
     use super::*;
     use crate::to_df_logical::to_logical_plan;
+    use crate::to_df_physical::to_physical_plan;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
+    use datafusion::physical_plan::displayable;
     use datafusion::prelude::SessionContext;
     use optd_core::{
-        Catalog, ExprData, Join, JoinType, MemoryCatalog, OperatorData, Output, PlannedQuery,
-        QueryContext, Remote, ScalarValue, TableRef,
+        Catalog, ColumnData, ExprData, Join, JoinType, MemoryCatalog, OperatorData, Output,
+        PlannedQuery, QueryContext, Remote, ScalarValue, TableRef,
     };
 
     /// Names of tables scanned by `plan`, not looking inside federated regions.
@@ -175,10 +198,10 @@ mod tests {
         regions
     }
 
-    #[tokio::test]
-    async fn lowers_remote_marker_to_federated_node() {
+    /// Returns `Output(Join(Remote[stub/db1](Join(a, c)), b))`, where `a` and `c` are remote
+    /// tables registered in `session` and `b` is local.
+    fn query_with_remote_region(session: &SessionContext) -> PlannedQuery {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let session = SessionContext::new();
         let catalog = Arc::new(MemoryCatalog::new("datafusion", "public"));
         for name in ["a", "b", "c"] {
             let provider: Arc<dyn TableProvider> = if name == "b" {
@@ -193,10 +216,10 @@ mod tests {
         }
 
         let mut query = QueryContext::new();
-        let mut scan = |table| {
-            query
-                .add_scan_from_catalog(catalog.as_ref(), TableRef::bare(table))
-                .unwrap()
+        // Qualified like the columns `from_df_logical` imports, so equal names stay distinct.
+        let mut scan = |table: &str| {
+            let id = ColumnData::with_qualifier("id", DataType::Int64, table).add(&mut query);
+            query.add_scan(TableRef::bare(table), vec![id])
         };
         let (a, b, c) = (scan("a"), scan("b"), scan("c"));
         let on = ExprData::Literal(ScalarValue::Boolean(true)).add(&mut query);
@@ -219,16 +242,37 @@ mod tests {
         let output = OperatorData::Output(Output { input: root }).add(&mut query);
         query.set_root(output);
 
-        let plan = to_logical_plan(&PlannedQuery::new(query, catalog), &session)
-            .await
-            .unwrap();
+        PlannedQuery::new(query, catalog)
+    }
 
-        assert_eq!(scanned_tables(&plan), vec!["datafusion.public.b"]);
+    #[tokio::test]
+    async fn lowers_remote_marker_to_federated_node() {
+        let session = SessionContext::new();
+        let planned = query_with_remote_region(&session);
+
+        let plan = to_logical_plan(&planned, &session).await.unwrap();
+
+        assert_eq!(scanned_tables(&plan), vec!["b"]);
         let regions = federated_regions(&plan);
         assert_eq!(regions.len(), 1);
-        assert_eq!(
-            scanned_tables(&regions[0]),
-            vec!["datafusion.public.a", "datafusion.public.c"]
+        assert_eq!(scanned_tables(&regions[0]), vec!["a", "c"]);
+    }
+
+    #[tokio::test]
+    async fn lowers_remote_marker_to_remote_execution_node() {
+        let session = SessionContext::new();
+        let planned = query_with_remote_region(&session);
+
+        let exec = to_physical_plan(&planned, &session).await.unwrap();
+
+        let plan = displayable(exec.as_ref()).indent(true).to_string();
+        assert_eq!(plan.matches("VirtualExecutionPlan").count(), 1, "{plan}");
+        assert!(
+            plan.contains(
+                "VirtualExecutionPlan name=stub compute_context=db1 \
+                 base_sql=SELECT a.id, c.id FROM a INNER JOIN c ON true"
+            ),
+            "{plan}"
         );
     }
 

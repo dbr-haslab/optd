@@ -36,9 +36,10 @@ use optd_core::{
     QueryContext, TableRef,
 };
 
+use crate::federation::federated_exec;
 use crate::to_df_logical::{
     ColumnQualifiers, TableMap, ToDFError, ToDfContext, convert_agg_expr, convert_expr,
-    convert_join_type, optd_table_ref_to_df,
+    convert_join_type, optd_table_ref_to_df, to_logical_subplan,
 };
 
 /// Error type for the optd → DataFusion physical converter.
@@ -598,7 +599,21 @@ async fn convert_operator(
 
         OperatorData::TableFunction(_) => Err(ToPhysicalError::Unsupported("TableFunction".into())),
 
-        OperatorData::Remote(_) => Err(ToPhysicalError::Unsupported("Remote".into())),
+        OperatorData::Remote(remote) => {
+            let region = to_logical_subplan(remote.input, ctx, catalog, session).await?;
+            let required_exprs = required
+                .iter()
+                .map(|column| logical_column_expr(*column, ctx))
+                .collect::<Vec<_>>();
+            let region = datafusion::logical_expr::LogicalPlanBuilder::from(region)
+                .project(required_exprs)?
+                .build()?;
+            Ok(PhysicalPlanNode {
+                exec: federated_exec(region, &remote.source, &session.state()).await?,
+                df_schema: df_schema_for_columns(ctx, required)?,
+                columns: required.to_vec(),
+            })
+        }
     }
 }
 

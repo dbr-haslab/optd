@@ -113,11 +113,20 @@ pub async fn to_logical_plan(
     let root = ctx
         .root()
         .ok_or_else(|| ToDFError::Unsupported("query has no root".into()))?;
+    to_logical_subplan(root, ctx, &planned.catalog, session).await
+}
 
+/// Converts the optd subtree rooted at `op` into a DataFusion `LogicalPlan`.
+pub(crate) async fn to_logical_subplan(
+    op: Operator,
+    ctx: &QueryContext,
+    catalog: &Arc<dyn optd_core::Catalog>,
+    session: &SessionContext,
+) -> ToDFResult<LogicalPlan> {
     // Collect all table sources referenced in the plan (async, done once).
-    let tables = collect_tables(root, ctx, session).await?;
+    let tables = collect_tables(op, ctx, session).await?;
 
-    convert_operator(root, ctx, Arc::clone(&planned.catalog), &tables, session)
+    convert_operator(op, ctx, Arc::clone(catalog), &tables, session)
 }
 
 /// Walks the plan and collects a `TableSource` for every `Scan`.
