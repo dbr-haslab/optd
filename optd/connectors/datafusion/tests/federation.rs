@@ -253,3 +253,24 @@ async fn cheap_transfer_fetches_same_source_tables_separately() {
         "{queries:?}"
     );
 }
+
+/// Records a limitation: the hypergraph has edges only for written predicates, not for ones implied
+/// by equivalence classes. Written as `c.id = b.id`, the query is equivalent to the one in
+/// `expensive_transfer_joins_same_source_tables_at_the_source`, but DPhyp never considers `a ⋈ c`,
+/// so `db1` receives two scans instead of one join.
+#[tokio::test]
+async fn transitively_joined_same_source_tables_are_fetched_separately() {
+    let mut config = OptdExtensionConfig::default();
+    config.transfer_cost_per_row = 100.0;
+    let federation = federation_with(config, &SKEWED).await;
+
+    federation
+        .assert_matches_baseline(
+            "SELECT a.id, a.x, b.z, c.y FROM a JOIN b ON a.id = b.id JOIN c ON c.id = b.id",
+        )
+        .await;
+
+    federation.assert_scanned(&["a", "c"], &[]);
+    let queries = federation.db1.queries();
+    assert_eq!(queries.len(), 2, "{queries:?}");
+}

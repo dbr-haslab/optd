@@ -115,6 +115,11 @@ Two tests check join-order selection on skewed tables, with statistics collected
 data: the same query joins the two `db1` tables at the source when `optd.transfer_cost_per_row` is
 high and fetches them separately when it is low.
 
+A third test records a limitation. The hypergraph has edges only for predicates written in the
+query, not for ones implied by equivalence classes. Written with `c.id = b.id` instead of
+`a.id = c.id`, the high-transfer query is equivalent, but DPhyp never considers joining the two
+`db1` tables directly, so they are fetched separately.
+
 ## Simulated Sources
 
 `federation::SimulatedSource` is a remote database simulated by a separate DataFusion session.
