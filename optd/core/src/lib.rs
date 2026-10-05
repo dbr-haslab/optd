@@ -37,9 +37,9 @@ pub use hypergraph::{
     QueryHypergraph, build_hypergraph, nodeset_iter, nodeset_min, nodeset_singleton,
 };
 pub use optimize::{
-    Direction, ExprSimplify, HolisticUnnesting, JoinOrdering, JoinTreeNormalize,
-    MarkJoinToSemiJoin, OperatorRewrite, OperatorRewriteAdaptor, OptimizeError, OptimizeResult,
-    Pass, PassManager, PassProfile, PassResult, PassTrace, PredicatePushdown,
+    Direction, ExprSimplify, FederatedCost, FederationCostModel, HolisticUnnesting, JoinOrdering,
+    JoinTreeNormalize, MarkJoinToSemiJoin, OperatorRewrite, OperatorRewriteAdaptor, OptimizeError,
+    OptimizeResult, Pass, PassManager, PassProfile, PassResult, PassTrace, PredicatePushdown,
     ProjectionElimination, QueryPass, RemotePlacement, Rewrite, RewriteMap, SubqueryToJoin,
     Unnesting, operator_source,
 };

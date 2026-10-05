@@ -34,6 +34,25 @@ them run at `s`. `Output`, `Remote`, and inputless operators other than scans ru
 operator is assumed pushable; per-dialect support checks are future work. Subqueries inside
 expressions are not visited because unnesting removes them earlier.
 
+## Federation Cost Model
+
+`FederationCostModel` lets join ordering account for where tables live. Its cost,
+`FederatedCost { remote, delivered }`, records the source and accumulated remote cost when a whole
+subtree runs at one source, and the cost to have the subtree's rows available locally; plans compare
+by `delivered`. It uses `operator_source`, the same rule as placement:
+
+- A local operator costs what `DefaultCostModel` says, plus its inputs' delivered costs.
+- An operator at source `s` costs `remote_cost_factor` times that at `s`, plus its inputs' remote
+  costs, and its delivered cost adds `transfer_cost_per_row` for each output row.
+- A `Remote` marker adds nothing, because its input's delivered cost already includes the transfer.
+  Placement therefore does not change a plan's cost.
+
+Because a single-source table set is pushable in every join order, DPhyp's one best plan per table
+set stays correct with this cost. Whether pushdown wins depends on the parameters: the default model
+charges hash joins `(left_rows * right_rows)^0.75`, wherever they run, so pushing a join pays off
+when the rows it saves transferring outweigh its remote cost. Both parameters default to `1.0` and
+are not calibrated; transfer is charged per row, not per byte.
+
 ## DataFusion Connector
 
 The connector depends on `datafusion-federation` 0.5.3, which requires DataFusion 53; upgrade both

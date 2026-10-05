@@ -5,8 +5,9 @@
 //! remote scan ends up under exactly one marker, and markers never nest.
 
 use crate::{
-    Catalog, Operator, OperatorData, OptimizerContext, QueryContext, Remote, SourceId,
-    optimize::{OptimizeResult, Pass, PassResult, QueryPass},
+    AnalysisContext, CardinalityEstimationV1, Catalog, CostModel, DefaultCostModel, Operator,
+    OperatorData, OptimizerContext, QueryContext, Relation, Remote, SourceId,
+    optimize::{OptimizeError, OptimizeResult, Pass, PassResult, QueryPass},
 };
 
 /// Returns the remote source that can execute `op` as a whole, given the sources of its inputs.
@@ -106,12 +107,138 @@ fn wrap(op: Operator, source: Option<SourceId>, query: &mut QueryContext) -> Ope
     }
 }
 
+/// Cost of a subtree under federation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FederatedCost {
+    /// The source and the cost accumulated there, when the whole subtree runs at one source.
+    pub remote: Option<(SourceId, f64)>,
+    /// Cost to have the subtree's rows available locally, including any transfer.
+    pub delivered: f64,
+}
+
+/// Cost model that predicts remote placement and charges transfer where rows leave a source.
+///
+/// A local operator costs what [`DefaultCostModel`] says. An operator that [`operator_source`]
+/// places at a source costs `remote_cost_factor` times that at the source, and bringing its rows
+/// local costs `transfer_cost_per_row` each. Join ordering with this model keeps same-source
+/// tables together when that transfers fewer rows. A `Remote` marker adds nothing: its input's
+/// delivered cost already includes the transfer, so placement does not change a plan's cost.
+#[derive(Debug, Clone, Copy)]
+pub struct FederationCostModel {
+    pub transfer_cost_per_row: f64,
+    pub remote_cost_factor: f64,
+}
+
+impl Default for FederationCostModel {
+    /// unit costs; calibrate against real sources when they are available.
+    fn default() -> Self {
+        Self {
+            transfer_cost_per_row: 1.0,
+            remote_cost_factor: 1.0,
+        }
+    }
+}
+
+impl CostModel for FederationCostModel {
+    type Cost = FederatedCost;
+
+    fn zero(&self) -> Self::Cost {
+        FederatedCost {
+            remote: None,
+            delivered: 0.0,
+        }
+    }
+
+    /// Adds delivered costs. The sum is not attributed to any source.
+    fn add(&self, left: Self::Cost, right: Self::Cost) -> Self::Cost {
+        FederatedCost {
+            remote: None,
+            delivered: left.delivered + right.delivered,
+        }
+    }
+
+    fn is_better(&self, candidate: &Self::Cost, existing: &Self::Cost) -> bool {
+        candidate.delivered.total_cmp(&existing.delivered).is_lt()
+    }
+
+    /// Returns the operator's local cost, ignoring placement.
+    fn operator_cost(
+        &self,
+        op: Operator,
+        ctx: &QueryContext,
+        analyses: &mut AnalysisContext,
+    ) -> OptimizeResult<Self::Cost> {
+        Ok(FederatedCost {
+            remote: None,
+            delivered: DefaultCostModel.operator_cost(op, ctx, analyses)?,
+        })
+    }
+
+    fn total_cost_from_children(
+        &self,
+        op: Operator,
+        child_costs: &[Self::Cost],
+        ctx: &QueryContext,
+        analyses: &mut AnalysisContext,
+    ) -> OptimizeResult<Self::Cost> {
+        let data = ctx.operator(op);
+        if data.inputs().len() != child_costs.len() {
+            return Err(OptimizeError::PassError {
+                pass: "FederationCostModel",
+                message: format!(
+                    "operator {op} has {} inputs but received {} child costs",
+                    data.inputs().len(),
+                    child_costs.len()
+                ),
+            });
+        }
+        let inputs_delivered: f64 = child_costs.iter().map(|cost| cost.delivered).sum();
+        if matches!(data, OperatorData::Remote(_)) {
+            return Ok(FederatedCost {
+                remote: None,
+                delivered: inputs_delivered,
+            });
+        }
+
+        let local = DefaultCostModel.operator_cost(op, ctx, analyses)?;
+        let input_sources: Vec<_> = child_costs
+            .iter()
+            .map(|cost| cost.remote.as_ref().map(|(source, _)| source.clone()))
+            .collect();
+        let catalog = analyses.catalog().clone();
+        let Some(source) = operator_source(data, &input_sources, catalog.as_ref()) else {
+            return Ok(FederatedCost {
+                remote: None,
+                delivered: local + inputs_delivered,
+            });
+        };
+
+        let inputs_remote: f64 = child_costs
+            .iter()
+            .filter_map(|cost| cost.remote.as_ref().map(|(_, remote)| remote))
+            .sum();
+        let remote = self.remote_cost_factor * local + inputs_remote;
+        let rows = analyses
+            .get::<CardinalityEstimationV1>(ctx, op)
+            .map_err(|error| OptimizeError::PassError {
+                pass: "FederationCostModel",
+                message: error.to_string(),
+            })?
+            .rows
+            .value;
+        Ok(FederatedCost {
+            remote: Some((source, remote)),
+            delivered: remote + self.transfer_cost_per_row * rows,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        ExprData, Join, JoinType, MemoryCatalog, Output, PassManager, Relation, ScalarValue,
-        TableRef,
+        BinaryOp, Column, ColumnStatistics, ExprData, Join, JoinOrdering, JoinType, MemoryCatalog,
+        Output, PassManager, ScalarValue, TableRef, TableStatistics,
     };
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
@@ -239,5 +366,140 @@ mod tests {
             RemotePlacement.run(&mut opt).unwrap(),
             PassResult::Unchanged
         );
+    }
+
+    fn stats(rows: usize) -> TableStatistics {
+        TableStatistics {
+            row_count: Some(rows),
+            size_bytes: None,
+            column_statistics: [(
+                "id".to_string(),
+                ColumnStatistics {
+                    lower_bound: None,
+                    upper_bound: None,
+                    frequency: Some(rows),
+                    distinct: Some(rows),
+                    distribution: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            constraints: Default::default(),
+        }
+    }
+
+    fn id(query: &QueryContext, scan: Operator) -> Column {
+        let OperatorData::Scan(scan) = query.operator(scan) else {
+            panic!("expected a scan");
+        };
+        scan.columns[0]
+    }
+
+    fn eq_join(
+        query: &mut QueryContext,
+        (outer, left): (Operator, Column),
+        (inner, right): (Operator, Column),
+    ) -> Operator {
+        let left = ExprData::ColumnRef(left).add(query);
+        let right = ExprData::ColumnRef(right).add(query);
+        let on = ExprData::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        }
+        .add(query);
+        OperatorData::Join(Join {
+            join_type: JoinType::Inner,
+            on,
+            outer,
+            inner,
+        })
+        .add(query)
+    }
+
+    /// `(a ⋈ b) ⋈ c`, where `a` (10,000 rows) and `c` (1,000 rows) are at `pg/db1` and local
+    /// `b` holds 10.
+    ///
+    /// Joining `b` first is the locally cheapest order, but it brings all 11,000 rows of `a` and
+    /// `c` local; joining `a` and `c` at the source transfers an estimated 1,000.
+    fn skewed_federated_query() -> OptimizerContext {
+        let (catalog, mut query) =
+            catalog_with(&[("a", Some("pg/db1")), ("b", None), ("c", Some("pg/db1"))]);
+        for (name, rows) in [("a", 10_000), ("b", 10), ("c", 1_000)] {
+            catalog
+                .set_table_statistics(TableRef::bare(name), stats(rows))
+                .unwrap();
+        }
+        let a = scan(&mut query, &catalog, "a");
+        let b = scan(&mut query, &catalog, "b");
+        let c = scan(&mut query, &catalog, "c");
+        let (a_id, b_id, c_id) = (id(&query, a), id(&query, b), id(&query, c));
+        let ab = eq_join(&mut query, (a, a_id), (b, b_id));
+        let abc = eq_join(&mut query, (ab, a_id), (c, c_id));
+        let output = OperatorData::Output(Output { input: abc }).add(&mut query);
+        query.set_root(output);
+        OptimizerContext::new(query, catalog)
+    }
+
+    /// Orders joins with `model`, places remote regions, and returns the plan shape.
+    fn place_with(model: FederationCostModel) -> String {
+        let mut opt = skewed_federated_query();
+        let mut pm = PassManager::with_max_iterations(2);
+        pm.add_pass(JoinOrdering::with_cost_model(model));
+        pm.add_pass(RemotePlacement);
+        pm.run(&mut opt).unwrap();
+        shape(&opt.query, opt.query.root().unwrap())
+    }
+
+    #[test]
+    fn expensive_transfer_joins_same_source_tables_at_the_source() {
+        let shape = place_with(FederationCostModel {
+            transfer_cost_per_row: 100.0,
+            remote_cost_factor: 1.0,
+        });
+
+        assert!(
+            shape.contains("Remote[pg/db1](Join(a, c))")
+                || shape.contains("Remote[pg/db1](Join(c, a))"),
+            "{shape}"
+        );
+    }
+
+    #[test]
+    fn cheap_transfer_keeps_the_locally_cheapest_order() {
+        let shape = place_with(FederationCostModel {
+            transfer_cost_per_row: 0.001,
+            remote_cost_factor: 1.0,
+        });
+
+        assert!(shape.contains("Remote[pg/db1](a)"), "{shape}");
+        assert!(shape.contains("Remote[pg/db1](c)"), "{shape}");
+    }
+
+    #[test]
+    fn placement_does_not_change_federated_cost() {
+        let model = FederationCostModel {
+            transfer_cost_per_row: 100.0,
+            remote_cost_factor: 1.0,
+        };
+        let mut opt = skewed_federated_query();
+        let mut pm = PassManager::with_max_iterations(2);
+        pm.add_pass(JoinOrdering::with_cost_model(model));
+        pm.run(&mut opt).unwrap();
+        let root = opt.query.root().unwrap();
+        let ordered = model
+            .total_cost(root, &opt.query, &mut opt.analyses)
+            .unwrap();
+
+        let mut pm = PassManager::with_max_iterations(2);
+        pm.add_pass(RemotePlacement);
+        pm.run(&mut opt).unwrap();
+        let root = opt.query.root().unwrap();
+        let placed = model
+            .total_cost(root, &opt.query, &mut opt.analyses)
+            .unwrap();
+
+        assert!(shape(&opt.query, root).contains("Remote[pg/db1](Join("));
+        assert_eq!(ordered, placed);
     }
 }

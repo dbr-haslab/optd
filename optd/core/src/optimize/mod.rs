@@ -15,7 +15,7 @@ pub use join_tree_normalize::JoinTreeNormalize;
 pub use mark_join_to_semi_join::MarkJoinToSemiJoin;
 pub use predicate_pushdown::PredicatePushdown;
 pub use projection_elimination::ProjectionElimination;
-pub use remote_placement::{RemotePlacement, operator_source};
+pub use remote_placement::{FederatedCost, FederationCostModel, RemotePlacement, operator_source};
 pub use subquery_to_join::SubqueryToJoin;
 pub use unnesting::Unnesting;
 
